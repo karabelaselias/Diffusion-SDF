@@ -6,6 +6,7 @@ import os
 import random
 import torch
 import torch.utils.data
+import numpy as np
 from . import base 
 from tqdm import tqdm
 
@@ -23,10 +24,10 @@ class PCloader(base.Dataset):
     ):
 
         self.pc_size = pc_size
-        self.gt_files = self.get_instance_filenames(data_source, split_file)
+        self.gt_files = self.get_instance_filenames(data_source, split_file, gt_filename="sdf_data.npy")
         self.return_filename = return_filename
 
-        self.pc_paths = self.get_instance_filenames(data_source, split_file)
+        self.pc_paths = self.get_instance_filenames(data_source, split_file, gt_filename="sdf_data.npy")
         self.pc_paths = self.pc_paths[:5] 
         print("loading {} point clouds into memory...".format(len(self.pc_paths)))
         lst = []
@@ -56,8 +57,12 @@ class PCloader(base.Dataset):
         '''
         f: path to csv file
         '''
+        if f.endswith('.npy'):
+            data = torch.from_numpy(np.load(f)).float()
+        else:
+            data = torch.from_numpy(pd.read_csv(f, sep=',', header=None).values).float()  
         # data = torch.from_numpy(np.loadtxt(f, delimiter=',')).float()
-        data = torch.from_numpy(pd.read_csv(f, sep=',',header=None).values).float()
+        # data = torch.from_numpy(pd.read_csv(f, sep=',',header=None).values).float()
         pc = data[data[:,-1]==0][:,:3]
         pc_idx = torch.randperm(pc.shape[0])[:samp] 
         pc = pc[pc_idx]

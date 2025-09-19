@@ -7,6 +7,9 @@ import plyfile
 import skimage.measure
 import time
 import torch
+import trimesh
+
+from diso import DiffDMC 
 
 
 # N: resolution of grid; 256 is typically sufficient 
@@ -15,7 +18,6 @@ import torch
 def create_mesh(
     model, shape_feature, filename, N=256, max_batch=1000000, level_set=0.0, occupancy=False, point_cloud=None, from_plane_features=False, from_pc_features=False
 ):
-    
     start_time = time.time()
     ply_filename = filename
 
@@ -24,33 +26,41 @@ def create_mesh(
     # the voxel_origin is the (bottom, left, down) corner, not the middle
     voxel_origin = [-1, -1, -1]
     voxel_size = 2.0 / (N - 1)
-    cube = create_cube(N)
+    cube = create_cube(N).float().cuda()
     cube_points = cube.shape[0]
 
+    # Pre-move to GPU
+    shape_feature = shape_feature.cuda()
+    
     head = 0
     while head < cube_points:
-        
         query = cube[head : min(head + max_batch, cube_points), 0:3].unsqueeze(0)
-        
         # inference defined in forward function per pytorch lightning convention
         #print("shapes: ", shape_feature.shape, query.shape)
         if from_plane_features:
-            pred_sdf = model.forward_with_plane_features(shape_feature.cuda(), query.cuda()).detach().cpu()
+            pred_sdf = model.forward_with_plane_features(shape_feature, query)
         else:
-            pred_sdf = model(shape_feature.cuda(), query.cuda()).detach().cpu()
-
-        cube[head : min(head + max_batch, cube_points), 3] = pred_sdf.squeeze()
-            
+            pred_sdf = model(shape_feature, query)
+        cube[head : min(head + max_batch, cube_points), 3] = pred_sdf.squeeze() 
         head += max_batch
     
     # for occupancy instead of SDF, subtract 0.5 so the surface boundary becomes 0
     sdf_values = cube[:, 3] - 0.5 if occupancy else cube[:, 3] 
     sdf_values = sdf_values.reshape(N, N, N) 
 
+    #diffdmc = DiffDMC(dtype=torch.float32).cuda()
+    #verts, faces = diffdmc(sdf_values, None, isovalue=level_set, normalize=True)
+    #verts[:, 0] = voxel_origin[0] + verts[:, 0]
+    #verts[:, 1] = voxel_origin[1] + verts[:, 1]
+    #verts[:, 2] = voxel_origin[2] + verts[:, 2]
+    #mesh = trimesh.Trimesh(vertices=verts.detach().cpu().numpy(), faces=faces.detach().cpu().numpy(), process=False)
     #print("inference time: {}".format(time.time() - start_time))
 
+    #mesh.export(file_obj=ply_filename+'.ply')
+    #stl_bytes = trimesh.exchange.stl.export_stl(mesh)
+    
     convert_sdf_samples_to_ply(
-        sdf_values.data,
+        sdf_values,
         voxel_origin,
         voxel_size,
         ply_filename + ".ply",
@@ -84,8 +94,6 @@ def create_cube(N):
 
     return samples
 
-
-
 def convert_sdf_samples_to_ply(
     pytorch_3d_sdf_tensor,
     voxel_grid_origin,
@@ -103,8 +111,11 @@ def convert_sdf_samples_to_ply(
 
     This function adapted from: https://github.com/RobotLocomotion/spartan
     """
-
-    numpy_3d_sdf_tensor = pytorch_3d_sdf_tensor.numpy()
+    #diffdmc = DiffDMC(dtype=torch.float32).cuda()
+    #verts, faces = diffdmc(pytorch_3d_sdf_tensor.float().cuda(), None, isovalue=voxel_size)
+    #print(verts)
+    
+    numpy_3d_sdf_tensor = pytorch_3d_sdf_tensor.detach().cpu().numpy()
 
     # use marching_cubes_lewiner or marching_cubes depending on pytorch version 
     try:
@@ -117,6 +128,7 @@ def convert_sdf_samples_to_ply(
 
     # transform from voxel coordinates to camera coordinates
     # note x and y are flipped in the output of marching_cubes
+
     mesh_points = np.zeros_like(verts)
     mesh_points[:, 0] = voxel_grid_origin[0] + verts[:, 0]
     mesh_points[:, 1] = voxel_grid_origin[1] + verts[:, 1]

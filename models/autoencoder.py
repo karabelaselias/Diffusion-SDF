@@ -16,6 +16,7 @@ class BetaVAE(nn.Module):
                  in_channels: int,
                  latent_dim: int,
                  hidden_dims: List = None,
+                 input_resolution: int = 64,
                  kl_std=1.0,
                  beta: int = 4,
                  gamma:float = 10., 
@@ -45,7 +46,7 @@ class BetaVAE(nn.Module):
         self.hidden_dims = hidden_dims
 
         # Build Encoder
-        for h_dim in hidden_dims:
+        for h_dim in self.hidden_dims:
             modules.append(
                 nn.Sequential(
                     nn.Conv2d(in_channels, out_channels=h_dim, kernel_size=3, stride=2, padding=1),
@@ -55,14 +56,20 @@ class BetaVAE(nn.Module):
             in_channels = h_dim
 
         self.encoder = nn.Sequential(*modules)
-        self.fc_mu = nn.Linear(hidden_dims[-1]*4, latent_dim)  # for plane features resolution 64x64, spatial resolution is 2x2 after the last encoder layer
-        self.fc_var = nn.Linear(hidden_dims[-1]*4, latent_dim) 
+
+        # Calculate spatial size after encoding
+        num_downsample = len(self.hidden_dims)  # 5 conv layers
+        self.encoded_spatial_size = input_resolution // (2**num_downsample)  # 64->2, 128->4, 256->8
+        flatten_size = hidden_dims[-1] * (self.encoded_spatial_size ** 2)
+        
+        self.fc_mu = nn.Linear(flatten_size, latent_dim)  # for plane features resolution 64x64, spatial resolution is 2x2 after the last encoder layer
+        self.fc_var = nn.Linear(flatten_size, latent_dim) 
 
 
         # Build Decoder
         modules = []
 
-        self.decoder_input = nn.Linear(latent_dim, hidden_dims[-1] * 4) 
+        self.decoder_input = nn.Linear(latent_dim, flatten_size) 
 
         hidden_dims.reverse()
 
@@ -123,7 +130,8 @@ class BetaVAE(nn.Module):
         '''
         
         result = self.decoder_input(z) # ([32, D*4])
-        result = result.view(-1, int(result.shape[-1]/4), 2, 2)  # for plane features resolution 64x64, spatial resolution is 2x2 after the last encoder layer
+        result = result.view(-1, self.hidden_dims[0], self.encoded_spatial_size, self.encoded_spatial_size) # for plane features resolution 64x64, spatial resolution is 2x2 after the last encoder layer
+        #result = result.view(-1, int(result.shape[-1]/4), 2, 2)  
         result = self.decoder(result)
         result = self.final_layer(result) # ([32, D, resolution, resolution])
         return result

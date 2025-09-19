@@ -26,17 +26,39 @@ from diff_utils.helpers import *
 
 from dataloader.pc_loader import PCloader
 
+def fix_compiled_state_dict(state_dict):
+    """Fix state dict keys from compiled models (remove _orig_mod wrapper)"""
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        # Remove _orig_mod from the keys
+        new_key = key.replace("._orig_mod", "")
+        new_state_dict[new_key] = value
+    return new_state_dict
+
 @torch.no_grad()
-def test_modulations():
+def test_modulations(args, specs):
     
     # load dataset, dataloader, model checkpoint
     test_split = json.load(open(specs["TestSplit"]))
     test_dataset = PCloader(specs["DataSource"], test_split, pc_size=specs.get("PCsize",1024), return_filename=True)
     test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, num_workers=0)
 
-    ckpt = "{}.ckpt".format(args.resume) if args.resume=='last' else "epoch={}.ckpt".format(args.resume)
+    specs['compile_model'] = False
+    specs['augment_training'] = False
+    
+    #ckpt = "{}.ckpt".format(args.resume) if args.resume=='last' else "epoch={}.ckpt".format(args.resume)
+    ckpt = "{}.ckpt".format(args.resume)
     resume = os.path.join(args.exp_dir, ckpt)
-    model = CombinedModel.load_from_checkpoint(resume, specs=specs).cuda().eval()
+
+    # Load checkpoint and fix compiled model keys
+    checkpoint = torch.load(resume)
+    checkpoint['state_dict'] = fix_compiled_state_dict(checkpoint['state_dict'])
+    #checkpoint['state_dict'] = fix_compiled_state_dict(checkpoint['state_dict'])
+    
+    #model = CombinedModel.load_from_checkpoint(resume, specs=specs).cuda().eval()
+    model = CombinedModel(specs) #.load_from_checkpoint(resume, specs=specs).cuda().eval()
+    model.load_state_dict(checkpoint['state_dict'])
+    model = model.cuda().eval()
 
     # filename for logging chamfer distances of reconstructed meshes
     cd_file = os.path.join(recon_dir, "cd.csv") 
@@ -60,7 +82,7 @@ def test_modulations():
             recon = model.vae_model.generate(plane_features) # ([1, D*3, resolution, resolution])
             #print("mesh filename: ", mesh_filename)
             # N is the grid resolution for marching cubes; set max_batch to largest number gpu can hold
-            mesh.create_mesh(model.sdf_model, recon, mesh_filename, N=256, max_batch=2**21, from_plane_features=True)
+            mesh.create_mesh(model.sdf_model, recon, mesh_filename, N=384, max_batch=2**21, from_plane_features=True)
 
             # load the created mesh (mesh_filename), and compare with input point cloud
             # to calculate and log chamfer distance 
@@ -77,7 +99,7 @@ def test_modulations():
             try:
                 # skips modulations that have chamfer distance > 0.0018
                 # the filter also weighs gaps / empty space higher
-                if not filter_threshold(mesh_filename, point_cloud, 0.0018): 
+                if not filter_threshold(mesh_filename, point_cloud, 0.006): 
                     continue
                 outdir = os.path.join(latent_dir, "{}/{}".format(cls_name, mesh_name))
                 os.makedirs(outdir, exist_ok=True)
@@ -91,7 +113,7 @@ def test_modulations():
 
            
 @torch.no_grad()
-def test_generation():
+def test_generation(args, specs):
 
     # load model 
     if args.resume == 'finetune': # after second stage of training 
@@ -189,6 +211,10 @@ if __name__ == "__main__":
         help="This directory should include experiment specifications in 'specs.json,' and logging will be done in this directory as well.",
     )
     arg_parser.add_argument(
+        "--specs", "-s", required=True,
+        help="The config specification for the experiment"
+    )
+    arg_parser.add_argument(
         "--resume", "-r", default=None,
         help="continue from previous saved logs, integer value, 'last', or 'finetune'",
     )
@@ -198,7 +224,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--filter", default=False, help='whether to filter when sampling conditionally')
 
     args = arg_parser.parse_args()
-    specs = json.load(open(os.path.join(args.exp_dir, "specs.json")))
+    specs = json.load(open(args.specs))
     print(specs["Description"])
 
 
@@ -208,8 +234,8 @@ if __name__ == "__main__":
     if specs['training_task'] == 'modulation':
         latent_dir = os.path.join(args.exp_dir, "modulations")
         os.makedirs(latent_dir, exist_ok=True)
-        test_modulations()
+        test_modulations(args, specs)
     elif specs['training_task'] == 'combined':
-        test_generation()
+        test_generation(args, specs)
 
   

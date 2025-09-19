@@ -10,7 +10,7 @@ import json
 #import open3d as o3d
 
 
-def get_split_filenames(data_source, split_file, f_name="sdf_data.csv"):
+def get_split_filenames(data_source, split_file, f_name="sdf_data.npy"):
     split = json.load(open(split_file))
     csvfiles = []
     for dataset in split: # e.g. "acronym" "shapenet"
@@ -27,7 +27,14 @@ def sample_pc(f, samp=1024, add_flip_augment=False):
     '''
     f: path to csv file
     '''
-    data = torch.from_numpy(pd.read_csv(f, sep=',',header=None).values).float()
+    if isinstance(f, str) and f.endswith('.npy'):
+        data = torch.from_numpy(np.load(f)).float()
+    elif isinstance(f, str) and f.endswith('.csv'):
+        data = torch.from_numpy(pd.read_csv(f, sep=',', header=None).values).float()
+    else:
+        # Assume it's already a tensor or array
+        data = f if torch.is_tensor(f) else torch.from_numpy(f).float()
+    #data = torch.from_numpy(pd.read_csv(f, sep=',',header=None).values).float()
     pc = data[data[:,-1]==0][:,:3]
     pc_idx = torch.randperm(pc.shape[0])[:samp] 
     pc = pc[pc_idx]

@@ -22,24 +22,24 @@ class SdfDecoder(nn.Module):
 
         self.block1 = nn.Sequential(
             nn.Linear(self.input_size, hidden_dim),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
         )
 
         self.block2 = nn.Sequential(
             nn.Linear(skip_dim, hidden_dim),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
         )
 
 

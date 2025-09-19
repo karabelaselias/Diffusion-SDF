@@ -39,8 +39,13 @@ class Dataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):     
         return NotImplementedError
 
-    def sample_pointcloud(self, csvfile, pc_size):
-        f=pd.read_csv(csvfile, sep=',',header=None).values
+    def sample_pointcloud(self, csvfile, pc_size): 
+        # Modified to handle NPY files
+        if csvfile.endswith('.npy'):
+            f = np.load(csvfile)
+        else:
+            f = pd.read_csv(csvfile, sep=',', header=None).values
+            f=pd.read_csv(csvfile, sep=',',header=None).values
 
         f = f[f[:,-1]==0][:,:3]
 
@@ -53,8 +58,13 @@ class Dataset(torch.utils.data.Dataset):
 
     def labeled_sampling(self, f, subsample, pc_size=1024, load_from_path=True):
         if load_from_path:
-            f=pd.read_csv(f, sep=',',header=None).values
-            f = torch.from_numpy(f)
+             # Modified to handle both CSV and NPY
+            if f.endswith('.npy'):
+                f = np.load(f)
+                f = torch.from_numpy(f)
+            else:
+                f = pd.read_csv(f, sep=',', header=None).values
+                f = torch.from_numpy(f)
 
         half = int(subsample / 2) 
         neg_tensor = f[f[:,-1]<0]
@@ -89,7 +99,7 @@ class Dataset(torch.utils.data.Dataset):
         return pc.float().squeeze(), samples[:,:3].float().squeeze(), samples[:, 3].float().squeeze() # pc, xyz, sdv
 
 
-    def get_instance_filenames(self, data_source, split, gt_filename="sdf_data.csv", filter_modulation_path=None):
+    def get_instance_filenames(self, data_source, split, gt_filename="sdf_data.npy", filter_modulation_path=None):
             
             do_filter = filter_modulation_path is not None 
             csvfiles = []

@@ -17,7 +17,6 @@ from models.archs.sdf_decoder import *
 from models.archs.encoders.conv_pointnet import ConvPointnet
 from utils import mesh, evaluate
 
-
 class SdfModel(pl.LightningModule):
 
     def __init__(self, specs):
@@ -29,19 +28,17 @@ class SdfModel(pl.LightningModule):
         self.latent_dim = model_specs["latent_dim"]
         self.skip_connection = model_specs.get("skip_connection", True)
         self.tanh_act = model_specs.get("tanh_act", False)
-        self.pn_hidden = model_specs.get("pn_hidden_dim", self.latent_dim)
-
-        self.pointnet = ConvPointnet(c_dim=self.latent_dim, hidden_dim=self.pn_hidden, plane_resolution=64)
+        self.pn_hidden = model_specs.get("pn_hidden_dim", self.latent_dim)        
+        self.pointnet = ConvPointnet(c_dim=self.latent_dim, hidden_dim=self.pn_hidden, plane_resolution=model_specs.get("plane_resolution", 64))
         
         self.model = SdfDecoder(latent_size=self.latent_dim, hidden_dim=self.hidden_dim, skip_connection=self.skip_connection, tanh_act=self.tanh_act)
         
         self.model.train()
         #print(self.model)
-
-
+    
     def configure_optimizers(self):
 
-        optimizer = torch.optim.Adam(self.parameters(), self.specs["sdf_lr"])
+        optimizer = torch.optim.AdamW(self.parameters(), self.specs["sdf_lr"], fused=True)
         return optimizer
 
  
@@ -57,11 +54,9 @@ class SdfModel(pl.LightningModule):
 
         sdf_loss = F.l1_loss(pred_sdf.squeeze(), gt.squeeze(), reduction = 'none')
         sdf_loss = reduce(sdf_loss, 'b ... -> b (...)', 'mean').mean()
-    
+
         return sdf_loss 
             
-    
-
     def forward(self, pc, xyz):
         shape_features = self.pointnet(pc, xyz)
 

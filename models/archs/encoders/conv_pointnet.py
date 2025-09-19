@@ -26,7 +26,7 @@ class ConvPointnet(nn.Module):
     def __init__(self, c_dim=512, dim=3, hidden_dim=128, scatter_type='max', 
                  unet=True, unet_kwargs={"depth": 4, "merge_mode": "concat", "start_filts": 32}, 
                  plane_resolution=64, plane_type=['xz', 'xy', 'yz'], padding=0.1, n_blocks=5,
-                 inject_noise=False):
+                 inject_noise=False, use_dropout=True):
         super().__init__()
         self.c_dim = c_dim
 
@@ -53,6 +53,8 @@ class ConvPointnet(nn.Module):
         elif scatter_type == 'mean':
             self.scatter = scatter_mean
 
+        self.use_dropout = use_dropout
+
     def generate_plane_features(self, p, c, plane='xz'):
         # acquire indices of features in plane
         xy = self.normalize_coordinate(p.clone(), plane=plane, padding=self.padding) # normalize to the range of (0, 1)
@@ -64,6 +66,10 @@ class ConvPointnet(nn.Module):
         fea_plane = scatter_mean(c, index, out=fea_plane) # B x 512 x reso^2
         fea_plane = fea_plane.reshape(p.size(0), self.c_dim, self.reso_plane, self.reso_plane) # sparce matrix (B x 512 x reso x reso)
 
+        # Add dropout during training without changing architecture
+        if self.training and hasattr(self, 'use_dropout'):
+            fea_plane = F.dropout2d(fea_plane, p=0.1, training=True)
+        
         # process the plane features with UNet
         if self.unet is not None:
             fea_plane = self.unet(fea_plane)

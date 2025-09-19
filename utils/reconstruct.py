@@ -136,6 +136,7 @@ def vis_recon(test_dataloader, sdf_model, vae_model, recon_dir, take_mod=False, 
 
 def filter_threshold(mesh, gt_pc, threshold): # mesh is path to mesh without .ply ext
     cd = evaluate.main(gt_pc, mesh, None, None, return_value=True, prioritize_cov=True)
+    #breakpoint()
     return cd <= threshold
 
 
