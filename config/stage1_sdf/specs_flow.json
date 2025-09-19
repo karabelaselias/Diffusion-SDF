@@ -1,0 +1,37 @@
+{
+    "Description" : "training joint SDF-VAE model for modulating SDFs on the atria dataset",
+    "DataSource" : "/home/karabele/data/atria_data_elena/surfaces/diffsdf_data",
+    "GridSource" : "/home/karabele/data/atria_data_elena/surfaces/diffsdf_grid_data",
+    "TrainSplit" : "/home/karabele/data/atria_data_elena/surfaces/diffsdf_data/splits/all.json",
+    "TestSplit" : "/home/karabele/data/atria_data_elena/surfaces/diffsdf_data/splits/all.json",
+
+    "wandb_project" : "atria_3d_diffusion_with_eikonal",
+    
+    "training_task": "modulation",
+    "augment_training": true,
+    "compile_model": false,
+  
+    "SdfModelSpecs" : {
+      "hidden_dim" : 512,
+      "latent_dim" : 256,
+      "pn_hidden_dim" : 128,
+      "num_layers" : 9,
+      "use_eikonal": true,
+      "eikonal_weight": 0.001
+    },
+
+    "SampPerMesh" : 32000,
+    "PCsize" : 2048,
+  
+    "num_epochs" : 100001,
+    "log_freq" : 100,
+    "kld_weight" : 1e-5,
+    "latent_std" : 0.25,
+    "use_normalizing_flow": false,
+    "flow_depth": 3,
+    "flow_hidden_dim": 512,
+    "sdf_lr" : 1e-4
+}
+  
+  
+  
