@@ -4,7 +4,7 @@ import torch
 import torch.utils.data 
 from torch.nn import functional as F
 import pytorch_lightning as pl
-
+import logging
 import glob
 from datetime import datetime
 
@@ -59,7 +59,7 @@ torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 
 def train(args, specs):
-    
+
     # Determine stage from specs
     stage = specs.get('training_task', 'unknown')  # 'modulation', 'diffusion', or 'combined'
     
@@ -73,7 +73,7 @@ def train(args, specs):
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.batch_size, num_workers=args.workers,
-        drop_last=True, shuffle=True, pin_memory=True, persistent_workers=False
+        drop_last=True, shuffle=True, pin_memory=True, persistent_workers=True
     )
 
     # Setup WandB
@@ -183,16 +183,28 @@ def train(args, specs):
     
     # precision 16 can be unstable (nan loss); recommend using 32
     from pytorch_lightning.strategies import DDPStrategy
+    
+    from torch.distributed.algorithms.ddp_comm_hooks import (
+        default_hooks as default,
+        powerSGD_hook as powerSGD,
+    )
+
     trainer = pl.Trainer(accelerator='gpu', 
                          devices=args.num_gpus, 
-                         strategy=DDPStrategy(gradient_as_bucket_view=True, static_graph=True) if args.num_gpus > 1 else 'auto',  # Only use DDP for multi-GPU
-                         precision=32, 
+                         strategy=DDPStrategy(
+                                gradient_as_bucket_view=True, 
+                                static_graph=args.static_graph,
+                                find_unused_parameters=False
+                             ) if args.num_nodes > 1 else 'auto',
+                         precision='bf16-mixed', 
                          max_epochs=specs["num_epochs"], 
                          callbacks=callbacks, 
                          log_every_n_steps=1,
                          logger=loggers,
                          default_root_dir=args.exp_dir,
-                         gradient_clip_val=1.0
+                         gradient_clip_val=1.0,
+                         num_nodes=args.num_nodes,
+                         accumulate_grad_batches = 4 if args.num_nodes > 1 else 1
                          )
     trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
 
@@ -202,6 +214,11 @@ def train(args, specs):
 if __name__ == "__main__":
 
     import argparse
+    # Silence all but rank 0
+    if get_rank() != 0:
+        logging.basicConfig(level=logging.WARNING)
+        # Reduce PyTorch Lightning verbosity
+        pl._logger.setLevel(logging.WARNING)
 
     arg_parser = argparse.ArgumentParser()
     
@@ -221,14 +238,11 @@ if __name__ == "__main__":
     )
 
     arg_parser.add_argument("--batch_size", "-b", default=32, type=int)
-    arg_parser.add_argument( "--workers", "-w", default=8, type=int)
-    arg_parser.add_argument( "--num_gpus", "-g", default=1, type=int)
-    
+    arg_parser.add_argument("--workers", "-w", default=8, type=int)
+    arg_parser.add_argument("--num_gpus", "-g", default=1, type=int)
+    arg_parser.add_argument("--num_nodes", "-n", default=1, type=int)
+    arg_parser.add_argument("--static-graph", action='store_true')
 
     args = arg_parser.parse_args()
     specs = json.load(open(args.specs))
-        #os.path.join(args.exp_dir, "specs.json")))
-    print(specs["Description"])
-
-
     train(args, specs)

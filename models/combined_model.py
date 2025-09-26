@@ -30,7 +30,10 @@ class CombinedModel(pl.LightningModule):
             # Eikonal regularization parameters
             self.use_eikonal = specs["SdfModelSpecs"].get("use_eikonal", False)
             self.eikonal_weight = specs["SdfModelSpecs"].get("eikonal_weight", 0.01)
-            
+
+            # Register a dummy parameter for static graph
+            self.register_buffer('zero_loss', torch.tensor(0.0))
+
             if use_flow:
                 from models.autoencoder_flow import FlowBetaVAE
                 self.vae_model = FlowBetaVAE(
@@ -75,7 +78,7 @@ class CombinedModel(pl.LightningModule):
             outputs=pred_sdf,
             inputs=xyz,
             grad_outputs=d_output,
-            create_graph=False,
+            create_graph=True,
             retain_graph=True,
             only_inputs=True
         )[0]
@@ -99,9 +102,6 @@ class CombinedModel(pl.LightningModule):
         return eikonal
     
     def training_step(self, x, idx):
-        # Add this line at the very beginning
-        torch.compiler.cudagraph_mark_step_begin()
-        
         if self.task == 'combined':
             result = self.train_combined(x)
             return result
@@ -116,16 +116,16 @@ class CombinedModel(pl.LightningModule):
 
         if self.task == 'combined':
             params_list = [
-                    { 'params': list(self.sdf_model.parameters()) + list(self.vae_model.parameters()), 'lr':self.specs['sdf_lr'] , 'fused': True},
+                    { 'params': list(self.sdf_model.parameters()) + list(self.vae_model.parameters()), 'lr':self.specs['sdf_lr'], 'fused': True},
                     { 'params': self.diffusion_model.parameters(), 'lr':self.specs['diff_lr'], 'fused': True}
                 ]
         elif self.task == 'modulation':
             params_list = [
-                    { 'params': self.parameters(), 'lr':self.specs['sdf_lr'], 'fused' : True }
+                    { 'params': self.parameters(), 'lr':self.specs['sdf_lr'], 'fused':True}
                 ]
         elif self.task == 'diffusion':
             params_list = [
-                    { 'params': self.parameters(), 'lr':self.specs['diff_lr'], 'fused': True }
+                    { 'params': self.parameters(), 'lr':self.specs['diff_lr'], 'fused':True}
                 ]
 
         optimizer = torch.optim.Adam(params_list)
@@ -159,6 +159,8 @@ class CombinedModel(pl.LightningModule):
         # we only use the KL loss for the VAE; no reconstruction loss
         try:
             vae_loss = self.vae_model.loss_function(*out, M_N=self.specs["kld_weight"] )
+            if not isinstance(vae_loss, torch.Tensor):
+                vae_loss = torch.tensor(vae_loss, device=xyz.device)
         except:
             print("vae loss is nan at epoch {}...".format(self.current_epoch))
             return None # skips this batch
@@ -183,7 +185,7 @@ class CombinedModel(pl.LightningModule):
         else:
             loss_dict = {"sdf": sdf_loss, "vae": vae_loss, "total": loss}
             
-        self.log_dict(loss_dict, prog_bar=True, enable_graph=False)
+        self.log_dict(loss_dict, prog_bar=True, enable_graph=False, sync_dist=True)
         return loss
 
 
@@ -207,7 +209,7 @@ class CombinedModel(pl.LightningModule):
                         "diff100": diff_100_loss, # note that this can appear as nan when the training batch does not have sampled timesteps < 100
                         "diff1000": diff_1000_loss
                     }
-        self.log_dict(loss_dict, prog_bar=True, enable_graph=False)
+        self.log_dict(loss_dict, prog_bar=True, enable_graph=False, sync_dist=True)
 
         return diff_loss
 
@@ -313,6 +315,6 @@ class CombinedModel(pl.LightningModule):
         #                #"diff1000": diff_1000_loss,
         #                "gensdf": generated_sdf_loss,
         #            }
-        self.log_dict(loss_dict, prog_bar=True, enable_graph=False)
+        self.log_dict(loss_dict, prog_bar=True, enable_graph=False, sync_dist=True)
 
         return loss
