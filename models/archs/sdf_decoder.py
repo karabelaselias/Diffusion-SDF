@@ -10,36 +10,43 @@ import numpy as np
 class SdfDecoder(nn.Module):
     def __init__(self, latent_size=256, hidden_dim=512,
                  skip_connection=True, tanh_act=False,
-                 geo_init=True, input_size=None
+                 geo_init=True, input_size=None,
+                 activation='ReLU'
                  ):
         super().__init__()
         self.latent_size = latent_size
         self.input_size = latent_size+3 if input_size is None else input_size
         self.skip_connection = skip_connection
         self.tanh_act = tanh_act
+        
+        # Replace ReLU with Softplus
+        if activation == 'softplus':
+            self.activation = nn.Softplus(beta=100)  # High beta ≈ ReLU but smoother
+        else:
+            self.activation = nn.ReLU(inplace=True)
 
         skip_dim = hidden_dim+self.input_size if skip_connection else hidden_dim 
 
         self.block1 = nn.Sequential(
             nn.Linear(self.input_size, hidden_dim),
-            nn.ReLU(inplace=True),
+            self.activation,
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            self.activation,
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            self.activation,
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            self.activation,
         )
 
         self.block2 = nn.Sequential(
             nn.Linear(skip_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            self.activation,
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            self.activation,
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            self.activation,
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            self.activation,
         )
 
 

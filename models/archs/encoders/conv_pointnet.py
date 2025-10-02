@@ -3,8 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
 
-from torch_scatter import scatter_mean, scatter_max
+from torch_scatter import scatter_mean, scatter_max, scatter_add
 
+# Add this to ConvPointnet
+@torch.jit.script
+def fast_coordinate2index(x: torch.Tensor, reso: int) -> torch.Tensor:
+    x = (x * reso).long()
+    x = torch.clamp(x, 0, reso - 1)
+    index = x[:, :, 0] + reso * x[:, :, 1]
+    return index.unsqueeze(1)
 
 class ConvPointnet(nn.Module):
     ''' PointNet-based encoder network with ResNet blocks for each point.
@@ -25,7 +32,7 @@ class ConvPointnet(nn.Module):
 
     def __init__(self, c_dim=512, dim=3, hidden_dim=128, scatter_type='max', 
                  unet=True, unet_kwargs={"depth": 4, "merge_mode": "concat", "start_filts": 32}, 
-                 plane_resolution=64, plane_type=['xz', 'xy', 'yz'], padding=0.1, n_blocks=5,
+                 plane_resolution=64, plane_type=['xz', 'xy', 'yz'], padding=0.15, n_blocks=5,
                  inject_noise=False, use_dropout=True):
         super().__init__()
         self.c_dim = c_dim
@@ -56,26 +63,53 @@ class ConvPointnet(nn.Module):
         self.use_dropout = use_dropout
 
     def generate_plane_features(self, p, c, plane='xz'):
-        # acquire indices of features in plane
-        xy = self.normalize_coordinate(p.clone(), plane=plane, padding=self.padding) # normalize to the range of (0, 1)
+        xy = self.normalize_coordinate(p.clone(), plane=plane, padding=self.padding)
         index = self.coordinate2index(xy, self.reso_plane)
-
-        # scatter plane features from points
-        fea_plane = c.new_zeros(p.size(0), self.c_dim, self.reso_plane**2)
-        c = c.permute(0, 2, 1) # B x 512 x T
-        fea_plane = scatter_mean(c, index, out=fea_plane) # B x 512 x reso^2
-        fea_plane = fea_plane.reshape(p.size(0), self.c_dim, self.reso_plane, self.reso_plane) # sparce matrix (B x 512 x reso x reso)
-
-        # Add dropout during training without changing architecture
-        if self.training and hasattr(self, 'use_dropout'):
-            fea_plane = F.dropout2d(fea_plane, p=0.1, training=True)
         
-        # process the plane features with UNet
+        batch_size = p.size(0)
+        c = c.permute(0, 2, 1)
+
+        # Get both mean and max features
+        fea_plane_mean = scatter_mean(c, index, dim=2, dim_size=self.reso_plane**2)
+        fea_plane_max, _ = scatter_max(c, index, dim=2, dim_size=self.reso_plane**2)
+
+        # Count points per cell
+        ones = torch.ones(batch_size, 1, c.shape[2], device=c.device)
+        count = scatter_add(ones, index, dim=2, dim_size=self.reso_plane**2)
+
+        # Reshape to 2D
+        fea_plane_mean = fea_plane_mean.reshape(batch_size, self.c_dim, self.reso_plane, self.reso_plane)
+        fea_plane_max = fea_plane_max.reshape(batch_size, self.c_dim, self.reso_plane, self.reso_plane)
+        count_grid = count.reshape(batch_size, 1, self.reso_plane, self.reso_plane)
+
+        # Start with max features (they're non-zero even for single-point cells)
+        fea_plane = fea_plane_max.clone()
+
+        # Progressively dilate to fill voids
+        kernel_size = 3
+        for i in range(8):  # 8 iterations fills up to 16-pixel voids
+            # Find current empty cells
+            empty_mask = (count_grid == 0).float()    
+            if empty_mask.sum() == 0:
+                break  # All cells filled
+            # Dilate features into empty regions
+            dilated = F.max_pool2d(fea_plane, kernel_size, stride=1, padding=kernel_size//2)
+            # Only fill empty cells, preserve original occupied cells
+            fea_plane = fea_plane * (1 - empty_mask) + dilated * empty_mask
+            # Update count for next iteration
+            count_dilated = F.max_pool2d(count_grid, kernel_size, stride=1, padding=kernel_size//2)
+            count_grid = count_grid * (1 - empty_mask) + count_dilated * empty_mask
+        
+        # Blend with mean features where we have multiple points
+        # Use sigmoid to create smooth transition
+        blend_weight = torch.sigmoid((count_grid - 2.0) / 1.0)  # Transitions around 2 points/cell
+        fea_plane = fea_plane * (1 - blend_weight) + fea_plane_mean * blend_weight
+            
         if self.unet is not None:
             fea_plane = self.unet(fea_plane)
-
-        return fea_plane 
-
+        
+        return fea_plane
+    
     # takes in "p": point cloud and "query": sdf_xyz 
     # sample plane features for unlabeled_query as well 
     def forward(self, p, query):
@@ -108,15 +142,49 @@ class ConvPointnet(nn.Module):
         fea = {}
         plane_feat_sum = 0
         #denoise_loss = 0
+        
         if 'xz' in self.plane_type:
             fea['xz'] = self.generate_plane_features(p, c, plane='xz') # shape: batch, latent size, resolution, resolution (e.g. 16, 256, 64, 64)
-            plane_feat_sum += self.sample_plane_feature(query, fea['xz'], 'xz')
+            #plane_feat_sum += self.sample_plane_feature(query, fea['xz'], 'xz')
         if 'xy' in self.plane_type:
             fea['xy'] = self.generate_plane_features(p, c, plane='xy')
-            plane_feat_sum += self.sample_plane_feature(query, fea['xy'], 'xy')
+            #plane_feat_sum += self.sample_plane_feature(query, fea['xy'], 'xy')
         if 'yz' in self.plane_type:
             fea['yz'] = self.generate_plane_features(p, c, plane='yz')
-            plane_feat_sum += self.sample_plane_feature(query, fea['yz'], 'yz')
+            #plane_feat_sum += self.sample_plane_feature(query, fea['yz'], 'yz')
+
+        # REPLACE simple summation with weighted aggregation
+        plane_features = []
+        plane_weights = []
+
+        if 'xz' in self.plane_type:
+            feat_xz = self.sample_plane_feature(query, fea['xz'], 'xz')
+            # Weight based on distance from y-axis (y=0 is problematic for xz plane)
+            weight_xz = torch.abs(query[:, :, 1:2]).transpose(2, 1) + 0.1  # Add 0.1 to avoid zero
+            plane_features.append(feat_xz)
+            plane_weights.append(weight_xz)
+
+        if 'xy' in self.plane_type:
+            feat_xy = self.sample_plane_feature(query, fea['xy'], 'xy')
+            # Weight based on distance from z-axis (z=0 is problematic for xy plane)
+            weight_xy = torch.abs(query[:, :, 2:3]).transpose(2, 1) + 0.1
+            plane_features.append(feat_xy)
+            plane_weights.append(weight_xy)
+    
+        if 'yz' in self.plane_type:
+            feat_yz = self.sample_plane_feature(query, fea['yz'], 'yz')
+            # Weight based on distance from x-axis (x=0 is problematic for yz plane)
+            weight_yz = torch.abs(query[:, :, 0:1]).transpose(2, 1) + 0.1
+            plane_features.append(feat_yz)
+            plane_weights.append(weight_yz)
+        
+        # Stack and normalize weights
+        plane_features = torch.stack(plane_features, dim=0)  # (3, B, C, N)
+        plane_weights = torch.stack(plane_weights, dim=0)     # (3, B, 1, N)
+        plane_weights = plane_weights / plane_weights.sum(dim=0, keepdim=True)  # Normalize
+    
+        # Weighted sum
+        plane_feat_sum = (plane_features * plane_weights).sum(dim=0)
 
         return plane_feat_sum.transpose(2,1)
 
@@ -128,11 +196,40 @@ class ConvPointnet(nn.Module):
         fea = {}
         fea['xz'], fea['xy'], fea['yz'] = plane_features[:,0:idx,...], plane_features[:,idx:idx*2,...], plane_features[:,idx*2:,...]
         #print("shapes: ", fea['xz'].shape, fea['xy'].shape, fea['yz'].shape) #([1, 256, 64, 64])
-        plane_feat_sum = 0
 
-        plane_feat_sum += self.sample_plane_feature(query, fea['xz'], 'xz')
-        plane_feat_sum += self.sample_plane_feature(query, fea['xy'], 'xy')
-        plane_feat_sum += self.sample_plane_feature(query, fea['yz'], 'yz')
+        # USE WEIGHTED AGGREGATION (same as forward())
+        plane_features_list = []
+        plane_weights = []
+
+        # XZ plane
+        feat_xz = self.sample_plane_feature(query, fea['xz'], 'xz')
+        weight_xz = torch.abs(query[:, :, 1:2]).transpose(2, 1) + 0.1
+        plane_features_list.append(feat_xz)
+        plane_weights.append(weight_xz)
+
+        # XY plane  
+        feat_xy = self.sample_plane_feature(query, fea['xy'], 'xy')
+        weight_xy = torch.abs(query[:, :, 2:3]).transpose(2, 1) + 0.1
+        plane_features_list.append(feat_xy)
+        plane_weights.append(weight_xy)
+
+        # YZ plane
+        feat_yz = self.sample_plane_feature(query, fea['yz'], 'yz')
+        weight_yz = torch.abs(query[:, :, 0:1]).transpose(2, 1) + 0.1
+        plane_features_list.append(feat_yz)
+        plane_weights.append(weight_yz)
+
+        # Stack, normalize, and weight
+        plane_features_tensor = torch.stack(plane_features_list, dim=0)
+        plane_weights = torch.stack(plane_weights, dim=0)
+        plane_weights = plane_weights / plane_weights.sum(dim=0, keepdim=True)
+    
+        plane_feat_sum = (plane_features_tensor * plane_weights).sum(dim=0)
+        
+        #plane_feat_sum = 0
+        #plane_feat_sum += self.sample_plane_feature(query, fea['xz'], 'xz')
+        #plane_feat_sum += self.sample_plane_feature(query, fea['xy'], 'xy')
+        #plane_feat_sum += self.sample_plane_feature(query, fea['yz'], 'yz')
 
         return plane_feat_sum.transpose(2,1)
 
@@ -147,11 +244,39 @@ class ConvPointnet(nn.Module):
         fea['xy'] = self.generate_plane_features(p, c, plane='xy')
         fea['yz'] = self.generate_plane_features(p, c, plane='yz')
 
-        plane_feat_sum = 0
+        # USE WEIGHTED AGGREGATION (same as forward())
+        plane_features_list = []
+        plane_weights = []
 
-        plane_feat_sum += self.sample_plane_feature(query, fea['xz'], 'xz')
-        plane_feat_sum += self.sample_plane_feature(query, fea['xy'], 'xy')
-        plane_feat_sum += self.sample_plane_feature(query, fea['yz'], 'yz')
+        # XZ plane
+        feat_xz = self.sample_plane_feature(query, fea['xz'], 'xz')
+        weight_xz = torch.abs(query[:, :, 1:2]).transpose(2, 1) + 0.1
+        plane_features_list.append(feat_xz)
+        plane_weights.append(weight_xz)
+
+        # XY plane  
+        feat_xy = self.sample_plane_feature(query, fea['xy'], 'xy')
+        weight_xy = torch.abs(query[:, :, 2:3]).transpose(2, 1) + 0.1
+        plane_features_list.append(feat_xy)
+        plane_weights.append(weight_xy)
+
+        # YZ plane
+        feat_yz = self.sample_plane_feature(query, fea['yz'], 'yz')
+        weight_yz = torch.abs(query[:, :, 0:1]).transpose(2, 1) + 0.1
+        plane_features_list.append(feat_yz)
+        plane_weights.append(weight_yz)
+
+        # Stack, normalize, and weight
+        plane_features_tensor = torch.stack(plane_features_list, dim=0)
+        plane_weights = torch.stack(plane_weights, dim=0)
+        plane_weights = plane_weights / plane_weights.sum(dim=0, keepdim=True)
+    
+        plane_feat_sum = (plane_features_tensor * plane_weights).sum(dim=0)
+        
+        #plane_feat_sum = 0
+        #plane_feat_sum += self.sample_plane_feature(query, fea['xz'], 'xz')
+        #plane_feat_sum += self.sample_plane_feature(query, fea['xy'], 'xy')
+        #plane_feat_sum += self.sample_plane_feature(query, fea['yz'], 'yz')
 
         return plane_feat_sum.transpose(2,1)
 
@@ -233,10 +358,15 @@ class ConvPointnet(nn.Module):
             reso (int): defined resolution
             coord_type (str): coordinate type
         '''
-        x = (x * reso).long()
-        index = x[:, :, 0] + reso * x[:, :, 1]
-        index = index[:, None, :]
-        return index
+        return fast_coordinate2index(x, reso)
+        #x = (x * reso).long()
+        # Ensure indices are within bounds
+        #x = torch.clamp(x, 0, reso - 1)  # ADD THIS
+
+        #index = x[:, :, 0] + reso * x[:, :, 1]
+        #index = index[:, None, :]
+        
+        #return index
 
 
     # xy is the normalized coordinates of the point cloud of each plane 
@@ -256,18 +386,24 @@ class ConvPointnet(nn.Module):
             c_out += fea
         return c_out.permute(0, 2, 1)
 
+    
     # sample_plane_feature function copied from /src/conv_onet/models/decoder.py
     # uses values from plane_feature and pixel locations from vgrid to interpolate feature
     def sample_plane_feature(self, query, plane_feature, plane):
         xy = self.normalize_coordinate(query.clone(), plane=plane, padding=self.padding)
         xy = xy[:, :, None].float()
         vgrid = 2.0 * xy - 1.0 # normalize to (-1, 1)
-        sampled_feat = F.grid_sample(plane_feature, vgrid, padding_mode='border', align_corners=True, mode='bilinear').squeeze(-1)
+        sampled_feat = F.grid_sample(plane_feature, 
+                                     vgrid, 
+                                     padding_mode='zeros', 
+                                     align_corners=False, 
+                                     mode='bilinear').squeeze(-1)
+        #sampled_feat = F.grid_sample(plane_feature, vgrid, padding_mode='border', align_corners=True, mode='bilinear').squeeze(-1)
         return sampled_feat
 
 
 def conv3x3(in_channels, out_channels, stride=1, 
-            padding=1, bias=True, groups=1):    
+            padding=1, bias=False, groups=1):    
     return nn.Conv2d(
         in_channels,
         out_channels,
@@ -297,7 +433,9 @@ def conv1x1(in_channels, out_channels, groups=1):
         out_channels,
         kernel_size=1,
         groups=groups,
-        stride=1)
+        stride=1,
+        bias=False
+    )
 
 
 class DownConv(nn.Module):
@@ -312,19 +450,37 @@ class DownConv(nn.Module):
         self.out_channels = out_channels
         self.pooling = pooling
 
-        self.conv1 = conv3x3(self.in_channels, self.out_channels)
-        self.conv2 = conv3x3(self.out_channels, self.out_channels)
+        # Use Sequential for better memory efficiency
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),  # inplace saves memory
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.pool = nn.MaxPool2d(2, 2) if pooling else nn.Identity()
+        
+        #self.conv1 = conv3x3(self.in_channels, self.out_channels)
+        #self.conv2 = conv3x3(self.out_channels, self.out_channels)
 
-        if self.pooling:
-            self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        # ADD THESE TWO LINES
+        #self.bn1 = nn.BatchNorm2d(self.out_channels)
+        #self.bn2 = nn.BatchNorm2d(self.out_channels)
+
+        #if self.pooling:
+        #    self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        before_pool = x
-        if self.pooling:
-            x = self.pool(x)
-        return x, before_pool
+        x = self.conv_block(x)
+        return self.pool(x), x
+        #x = F.relu(self.bn1(self.conv1(x)))  # Add bn1
+        #x = F.relu(self.bn2(self.conv2(x)))  # Add bn2
+        #before_pool = x
+        #if self.pooling:
+        #    x = self.pool(x)
+        #return x, before_pool
 
 
 class UpConv(nn.Module):
@@ -341,16 +497,32 @@ class UpConv(nn.Module):
         self.merge_mode = merge_mode
         self.up_mode = up_mode
 
-        self.upconv = upconv2x2(self.in_channels, self.out_channels, 
-            mode=self.up_mode)
+        self.upconv = upconv2x2(self.in_channels, self.out_channels, mode=self.up_mode)
+        
+        # Determine input channels after merge
+        conv_in_channels = 2 * out_channels if merge_mode == 'concat' else out_channels
 
-        if self.merge_mode == 'concat':
-            self.conv1 = conv3x3(
-                2*self.out_channels, self.out_channels)
-        else:
-            # num of input channels to conv2 is same
-            self.conv1 = conv3x3(self.out_channels, self.out_channels)
-        self.conv2 = conv3x3(self.out_channels, self.out_channels)
+        # Fused conv block (same pattern as DownConv)
+        self.conv_block = nn.Sequential(
+            nn.Conv2d(conv_in_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # ADD THESE TWO LINES
+        #self.bn1 = nn.BatchNorm2d(self.out_channels)
+        #self.bn2 = nn.BatchNorm2d(self.out_channels)
+        
+        #if self.merge_mode == 'concat':
+        #    self.conv1 = conv3x3(
+        #        2*self.out_channels, self.out_channels)
+        #else:
+        #    # num of input channels to conv2 is same
+        #    self.conv1 = conv3x3(self.out_channels, self.out_channels)
+        #self.conv2 = conv3x3(self.out_channels, self.out_channels)
 
 
     def forward(self, from_down, from_up):
@@ -360,12 +532,11 @@ class UpConv(nn.Module):
             from_up: upconv'd tensor from the decoder pathway
         """
         from_up = self.upconv(from_up)
-        if self.merge_mode == 'concat':
-            x = torch.cat((from_up, from_down), 1)
-        else:
-            x = from_up + from_down
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
+        x = torch.cat((from_up, from_down), 1) if self.merge_mode == 'concat' else from_up + from_down
+        #x = F.relu(self.bn1(self.conv1(x)))  # Add bn1
+        #x = F.relu(self.bn2(self.conv2(x)))  # Add bn2
+        # Single call to sequential block
+        x = self.conv_block(x)
         return x
 
 
@@ -467,12 +638,25 @@ class UNet(nn.Module):
 
         self.reset_params()
 
+    #@staticmethod
+    #def weight_init(m):
+    #    if isinstance(m, nn.Conv2d):
+    #        init.xavier_normal_(m.weight)
+    #        init.constant_(m.bias, 0)
+    
     @staticmethod
     def weight_init(m):
         if isinstance(m, nn.Conv2d):
             init.xavier_normal_(m.weight)
+            if m.bias is not None:
+                init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            init.constant_(m.weight, 1)
             init.constant_(m.bias, 0)
-
+        elif isinstance(m, nn.Linear):
+            init.xavier_normal_(m.weight)
+            if m.bias is not None:
+                init.constant_(m.bias, 0)
 
     def reset_params(self):
         for i, m in enumerate(self.modules()):
@@ -512,7 +696,7 @@ class ResnetBlockFC(nn.Module):
         size_h (int): hidden dimension
     '''
 
-    def __init__(self, size_in, size_out=None, size_h=None):
+    def __init__(self, size_in, size_out=None, size_h=None, use_bn=True):
         super().__init__()
         # Attributes
         if size_out is None:
@@ -524,10 +708,16 @@ class ResnetBlockFC(nn.Module):
         self.size_in = size_in
         self.size_h = size_h
         self.size_out = size_out
+        
         # Submodules
-        self.fc_0 = nn.Linear(size_in, size_h)
-        self.fc_1 = nn.Linear(size_h, size_out)
-        self.actvn = nn.ReLU()
+        self.fc_0 = nn.Linear(size_in, size_h, bias=not use_bn)
+        self.fc_1 = nn.Linear(size_h, size_out, bias=not use_bn)
+        
+        # Use LayerNorm for stability (faster than BatchNorm1d transpose)
+        self.ln0 = nn.LayerNorm(size_h) if use_bn else nn.Identity()
+        self.ln1 = nn.LayerNorm(size_out) if use_bn else nn.Identity()
+        
+        self.actvn = nn.ReLU(inplace=True)
 
         if size_in == size_out:
             self.shortcut = None
@@ -537,8 +727,12 @@ class ResnetBlockFC(nn.Module):
         nn.init.zeros_(self.fc_1.weight)
 
     def forward(self, x):
-        net = self.fc_0(self.actvn(x))
-        dx = self.fc_1(self.actvn(net))
+        
+        net = self.ln0(self.fc_0(self.actvn(x)))
+        dx = self.ln1(self.fc_1(self.actvn(net)))
+        
+        #net = self.fc_0(self.actvn(x))
+        #dx = self.fc_1(self.actvn(net))
 
         if self.shortcut is not None:
             x_s = self.shortcut(x)

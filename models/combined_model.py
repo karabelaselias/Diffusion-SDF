@@ -24,7 +24,7 @@ class CombinedModel(pl.LightningModule):
             feature_dim = specs["SdfModelSpecs"]["latent_dim"] # latent dim of pointnet 
             modulation_dim = feature_dim*3 # latent dim of modulation
             latent_std = specs.get("latent_std", 0.25) # std of target gaussian distribution of latent space
-            hidden_dims = [modulation_dim, modulation_dim, modulation_dim, modulation_dim, modulation_dim]
+            hidden_dims = None #[modulation_dim, modulation_dim, modulation_dim, modulation_dim, modulation_dim]
             plane_resolution = specs["SdfModelSpecs"].get("plane_resolution", 64)
             
             # Eikonal regularization parameters
@@ -32,7 +32,7 @@ class CombinedModel(pl.LightningModule):
             self.eikonal_weight = specs["SdfModelSpecs"].get("eikonal_weight", 0.01)
 
             # Register a dummy parameter for static graph
-            self.register_buffer('zero_loss', torch.tensor(0.0))
+            #self.register_buffer('zero_loss', torch.tensor(0.0))
 
             if use_flow:
                 from models.autoencoder_flow import FlowBetaVAE
@@ -318,3 +318,145 @@ class CombinedModel(pl.LightningModule):
         self.log_dict(loss_dict, prog_bar=True, enable_graph=False, sync_dist=True)
 
         return loss
+
+
+class CombinedModelVecSet(pl.LightningModule):
+    def __init__(self, specs):
+        super().__init__()
+        
+        self.task = specs['training_task']
+        self.specs = specs
+        
+        if self.task in ('combined', 'modulation'):
+            # Use VecSet-based SDF model
+            self.sdf_model = SdfModelVecSet(specs=specs)
+            # No separate VAE needed - bottleneck is built into VecSet
+            # The diffusion model works directly with VecSet latents
+            modulation_dim = specs["SdfModelSpecs"]["latent_dim"] * 256  # latent_dim * num_tokens
+            
+        if self.task in ('combined', 'diffusion'):
+            self.diffusion_model = DiffusionModel(
+                model=DiffusionNet(**specs["diffusion_model_specs"]), 
+                **specs["diffusion_specs"]
+            )
+    
+    def train_modulation(self, x):
+        xyz = x['xyz']
+        gt = x['gt_sdf'] 
+        pc = x['point_cloud']
+        
+        # Get latent and SDF predictions
+        latent, bottleneck = self.sdf_model.encode_to_latent(pc)
+        pred_sdf = self.sdf_model.decode_from_latent(latent, xyz)
+        
+        # SDF loss
+        #surface_weight = torch.exp(-50 * torch.abs(gt))  # Weight near-surface points more
+        #sdf_loss = torch.mean( F.l1_loss(pred_sdf, gt, reduction='none') * surface_weight )
+        #sdf_loss = F.l1_loss(..., reduction='none') * surface_weight
+        #sdf_loss = sdf_loss.mean()
+        sdf_loss = F.l1_loss(pred_sdf.squeeze(), gt.squeeze())
+        
+        # Regularization loss (if using KLBottleneck)
+        reg_loss = bottleneck.get('kl', torch.tensor(0.0)).mean() * self.specs.get("kld_weight", 0.0)
+        
+        loss = sdf_loss + reg_loss
+        
+        loss_dict = {"sdf": sdf_loss, "total": loss}
+        self.log_dict(loss_dict, prog_bar=True, enable_graph=False, sync_dist=True)
+        return loss
+
+    def train_diffusion(self, x):
+        self.train()
+
+        pc = x['point_cloud'] # (B, 1024, 3) or False if unconditional 
+        latent = x['latent'] # (B, D)
+
+        # unconditional training if cond is None 
+        cond = pc if self.specs['diffusion_model_specs']['cond'] else None 
+
+        # diff_100 and 1000 loss refers to the losses when t<100 and 100<t<1000, respectively 
+        # typically diff_100 approaches 0 while diff_1000 can still be relatively high
+        # visualizing loss curves can help with debugging if training is unstable
+        diff_loss, diff_100_loss, diff_1000_loss, pred_latent, perturbed_pc = self.diffusion_model.diffusion_model_from_latent(latent, cond=cond)
+
+        loss_dict =  {
+                        "total": diff_loss,
+                        "diff100": diff_100_loss, # note that this can appear as nan when the training batch does not have sampled timesteps < 100
+                        "diff1000": diff_1000_loss
+                    }
+        self.log_dict(loss_dict, prog_bar=True, enable_graph=False, sync_dist=True)
+
+        return diff_loss
+    
+    def train_combined(self, x):
+        xyz = x['xyz']  # [B, 16000, 3]
+        gt = x['gt_sdf']  # [B, 16000]
+        pc = x['point_cloud']  # [B, 8192, 3]
+        
+        # STEP 1: Encode to latent
+        latent_flat, bottleneck = self.sdf_model.encode_to_latent(pc) # [B, num_latents * latent_dim]
+        
+        # STEP 2: Decode to SDF
+        pred_sdf = self.sdf_model.decode_from_latent(latent_flat, xyz)
+        
+        # STEP 3: Losses
+        sdf_loss = F.l1_loss(pred_sdf.squeeze(), gt.squeeze())
+        reg_loss = bottleneck.get('kl', torch.tensor(0.0)).mean() * self.specs.get("kld_weight", 0.0)
+        
+        # STEP 4: Diffusion training
+        cond = pc if self.specs['diffusion_model_specs']['cond'] else None
+        diff_loss, _, _, pred_latent, _ = self.diffusion_model.diffusion_model_from_latent(
+            latent_flat, cond=cond
+        )
+        
+        # STEP 5: Decode generated latent
+        generated_sdf = self.sdf_model.decode_from_latent(pred_latent, xyz)
+        generated_sdf_loss = F.l1_loss(generated_sdf.squeeze(), gt.squeeze())
+        
+        loss = sdf_loss + reg_loss + diff_loss + generated_sdf_loss
+
+        loss_dict = {
+                "total": loss,
+                "sdf": sdf_loss,
+                "diff": diff_loss,
+                "gensdf": generated_sdf_loss,
+            }
+        
+        self.log_dict(loss_dict, prog_bar=True, enable_graph=False, sync_dist=True)
+        
+        return loss
+        
+    def training_step(self, x, idx):
+        if self.task == 'combined':
+            result = self.train_combined(x)
+            return result
+        elif self.task == 'modulation':
+            result = self.train_modulation(x)
+            return result
+        elif self.task == 'diffusion':
+            return self.train_diffusion(x)
+
+    def configure_optimizers(self):
+
+        if self.task == 'combined':
+            params_list = [
+                    { 'params': list(self.sdf_model.parameters()), 'lr':self.specs['sdf_lr'],  'fused': False},
+                    { 'params': self.diffusion_model.parameters(), 'lr':self.specs['diff_lr'], 'fused': False}
+                ]
+        elif self.task == 'modulation':
+            params_list = [
+                    { 'params': self.parameters(), 'lr':self.specs['sdf_lr'], 'fused': False}
+                ]
+        elif self.task == 'diffusion':
+            params_list = [
+                    { 'params': self.parameters(), 'lr':self.specs['diff_lr'], 'fused': False}
+                ]
+
+        optimizer = torch.optim.AdamW(params_list)
+        return {
+                "optimizer": optimizer,
+                 "lr_scheduler": {
+                     "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=10000, min_lr=1e-6),
+                     "monitor": "total"
+                 }
+        }

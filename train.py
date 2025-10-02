@@ -63,6 +63,7 @@ def train(args, specs):
     # Determine stage from specs
     stage = specs.get('training_task', 'unknown')  # 'modulation', 'diffusion', or 'combined'
     
+    
     # initialize dataset and loader
     split = json.load(open(specs["TrainSplit"], "r"))
     if specs['training_task'] == 'diffusion':
@@ -141,9 +142,10 @@ def train(args, specs):
     
     # pytorch lightning callbacks    
     lr_monitor = LearningRateMonitor(logging_interval='step')
+    
     callbacks = [callback, lr_monitor]
 
-    model = CombinedModel(specs)
+    model = CombinedModel(specs) if specs['SDFModel'] != 'vecset' else CombinedModelVecSet(specs)
     # Compile model if PyTorch 2.0+
     if torch.__version__ >= '2.0.0' and specs.get('compile_model', False) :
         print("Compiling model components...")
@@ -188,14 +190,15 @@ def train(args, specs):
         default_hooks as default,
         powerSGD_hook as powerSGD,
     )
-
+    
     trainer = pl.Trainer(accelerator='gpu', 
                          devices=args.num_gpus, 
                          strategy=DDPStrategy(
                                 gradient_as_bucket_view=True, 
                                 static_graph=args.static_graph,
-                                find_unused_parameters=False
-                             ) if args.num_nodes > 1 else 'auto',
+                                find_unused_parameters=False,
+                                ddp_comm_hook=default.fp16_compress_hook 
+                             ) if args.num_gpus > 1 else 'auto',
                          precision='bf16-mixed', 
                          max_epochs=specs["num_epochs"], 
                          callbacks=callbacks, 
@@ -204,12 +207,15 @@ def train(args, specs):
                          default_root_dir=args.exp_dir,
                          gradient_clip_val=1.0,
                          num_nodes=args.num_nodes,
-                         accumulate_grad_batches = 4 if args.num_nodes > 1 else 1
+                         accumulate_grad_batches = args.accumulate_grad_batches if hasattr(args, 'accumulate_grad_batches') else 1
+                         #accumulate_grad_batches = 2 if args.num_gpus > 1 else 1
                          )
-    trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
 
+    # sync batch norm
+    if args.num_gpus > 1:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     
-
+    trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
     
 if __name__ == "__main__":
 

@@ -9,7 +9,8 @@ from models.diffusion import *
 from models.archs.diffusion_arch import * 
 #from diffusion import *
 from models.sdf_model import SdfModel
+from models.sdf_model_vecsetx import SdfModelVecSet
 
-from models.combined_model import CombinedModel
+from models.combined_model import CombinedModel, CombinedModelVecSet
 
 

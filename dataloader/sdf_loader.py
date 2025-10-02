@@ -89,7 +89,9 @@ class SdfLoader(base.Dataset):
         pc_size=1024,
         modulation_path=None, # used for third stage of training; needs to be set in config file when some modulation training had been filtered
         use_npy=True,
-        augment=False
+        augment=False,
+        randomize_near_surface_ratio=True,  # New parameter
+        near_surface_ratio_range=(0.5, 0.95)  # New parameter
     ):
         self.use_npy = use_npy
         self.samples_per_mesh = samples_per_mesh
@@ -97,6 +99,8 @@ class SdfLoader(base.Dataset):
         self.augment = augment
         self.epoch_multiplier = 100 if self.augment else 1
         self.grid_source = grid_source
+        self.current_epoch = 0
+        self.surface_percentage = 0.7
         
         # Get filenames
         self.gt_filenames = self.get_instance_filenames(
@@ -123,6 +127,9 @@ class SdfLoader(base.Dataset):
         
         if grid_source:
             self.grid_data = self._load_all_files(self.grid_filenames, "Grid files")
+
+        self.randomize_near_surface_ratio = randomize_near_surface_ratio
+        self.near_surface_ratio_range = near_surface_ratio_range
     
     def _load_all_files(self, filenames, desc="Files"):
         """Load all files into memory with progress bar."""
@@ -185,8 +192,10 @@ class SdfLoader(base.Dataset):
         
     def __getitem__(self, idx): 
         idx %= len(self.gt_filenames)
+        
+        # For float 
+        #near_surface_count = int(self.samples_per_mesh*self.surface_percentage) if self.grid_source else self.samples_per_mesh
         near_surface_count = int(self.samples_per_mesh*0.7) if self.grid_source else self.samples_per_mesh
-
         # Sample from pre-loaded data (no file I/O here!)
         pc, sdf_xyz, sdf_gt = self.labeled_sampling(
             self.gt_data[idx], 

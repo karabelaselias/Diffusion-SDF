@@ -28,7 +28,10 @@ def create_mesh(
     voxel_size = 2.0 / (N - 1)
     cube = create_cube(N).float().cuda()
     cube_points = cube.shape[0]
-
+    
+    # add some noise to the cube values
+    #cube[:, 0:3] += torch.randn_like(cube[:, 0:3]) * 0.002
+    
     # Pre-move to GPU
     shape_feature = shape_feature.cuda()
     
