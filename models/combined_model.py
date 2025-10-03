@@ -344,24 +344,42 @@ class CombinedModelVecSet(pl.LightningModule):
         xyz = x['xyz']
         gt = x['gt_sdf'] 
         pc = x['point_cloud']
+
+        # Enable gradient computation for xyz
+        if self.specs['SdfModelSpecs'].get("use_eikonal", False):
+            xyz = xyz.requires_grad_(True)
         
         # Get latent and SDF predictions
         latent, bottleneck = self.sdf_model.encode_to_latent(pc)
         pred_sdf = self.sdf_model.decode_from_latent(latent, xyz)
         
         # SDF loss
-        #surface_weight = torch.exp(-50 * torch.abs(gt))  # Weight near-surface points more
-        #sdf_loss = torch.mean( F.l1_loss(pred_sdf, gt, reduction='none') * surface_weight )
+        surface_weight = torch.exp(-50 * torch.abs(gt))  # Weight near-surface points more
+        sdf_loss = torch.mean( F.l1_loss(pred_sdf.squeeze(), gt.squeeze(), reduction='none') * surface_weight )
         #sdf_loss = F.l1_loss(..., reduction='none') * surface_weight
         #sdf_loss = sdf_loss.mean()
-        sdf_loss = F.l1_loss(pred_sdf.squeeze(), gt.squeeze())
+        #sdf_loss = F.l1_loss(pred_sdf.squeeze(), gt.squeeze())
         
         # Regularization loss (if using KLBottleneck)
         reg_loss = bottleneck.get('kl', torch.tensor(0.0)).mean() * self.specs.get("kld_weight", 0.0)
+
+        # eikonal
+        if self.specs['SdfModelSpecs'].get("use_eikonal", False):
+            gradients = torch.autograd.grad(
+                outputs=pred_sdf,
+                inputs=xyz,
+                grad_outputs=torch.ones_like(pred_sdf, requires_grad=False, device=pred_sdf.device),
+                create_graph=True,  # Needed for backprop through gradients
+                retain_graph=True,   # Keep graph for loss.backward()
+                only_inputs=True
+            )[0]
+            eikonal_loss = ((gradients.norm(2, dim=-1) - 1) ** 2).mean() * self.specs['SdfModelSpecs'].get("eikonal_weight", 0.001)
+            loss = sdf_loss + eikonal_loss + reg_loss
+            loss_dict = {"sdf": sdf_loss, "eikonal": eikonal_loss, "total": loss}
+        else:
+            loss = sdf_loss + reg_loss
+            loss_dict = {"sdf": sdf_loss, "total": loss}
         
-        loss = sdf_loss + reg_loss
-        
-        loss_dict = {"sdf": sdf_loss, "total": loss}
         self.log_dict(loss_dict, prog_bar=True, enable_graph=False, sync_dist=True)
         return loss
 
@@ -440,16 +458,16 @@ class CombinedModelVecSet(pl.LightningModule):
 
         if self.task == 'combined':
             params_list = [
-                    { 'params': list(self.sdf_model.parameters()), 'lr':self.specs['sdf_lr'],  'fused': False},
-                    { 'params': self.diffusion_model.parameters(), 'lr':self.specs['diff_lr'], 'fused': False}
+                    { 'params': list(self.sdf_model.parameters()), 'lr':self.specs['sdf_lr'],  'fused': True},
+                    { 'params': self.diffusion_model.parameters(), 'lr':self.specs['diff_lr'], 'fused': True}
                 ]
         elif self.task == 'modulation':
             params_list = [
-                    { 'params': self.parameters(), 'lr':self.specs['sdf_lr'], 'fused': False}
+                    { 'params': self.parameters(), 'lr':self.specs['sdf_lr'], 'fused': True}
                 ]
         elif self.task == 'diffusion':
             params_list = [
-                    { 'params': self.parameters(), 'lr':self.specs['diff_lr'], 'fused': False}
+                    { 'params': self.parameters(), 'lr':self.specs['diff_lr'], 'fused': True}
                 ]
 
         optimizer = torch.optim.AdamW(params_list)
