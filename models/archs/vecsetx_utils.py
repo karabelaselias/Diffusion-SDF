@@ -69,7 +69,7 @@ class Attention(nn.Module):
         q = rearrange(q, 'b n (h d) -> b n h d', h = h)
         kv = rearrange(kv, 'b n (p h d) -> b n p h d', h = h, p=2)
 
-        out = flash_attn_kvpacked_func(q.bfloat16(), kv.bfloat16(), window_size=(window_size, window_size))
+        out = flash_attn_kvpacked_func(q.bfloat16(), kv.bfloat16(), window_size=(window_size, window_size), dropout_p = 0.1 if self.training else 0.0)
         out = out.to(x.dtype)
 
         return self.to_out(rearrange(out, 'b n h d -> b n (h d)'))

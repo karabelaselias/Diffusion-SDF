@@ -13,6 +13,113 @@ import numpy as np
 import csv, json
 
 from tqdm import tqdm
+from typing import Optional
+
+def _copysign(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    Return a tensor where each element has the absolute value taken from the,
+    corresponding element of a, with sign taken from the corresponding
+    element of b. This is like the standard copysign floating-point operation,
+    but is not careful about negative 0 and NaN.
+
+    Args:
+        a: source tensor.
+        b: tensor whose signs will be used, of the same shape as a.
+
+    Returns:
+        Tensor of the same shape as a with the signs of b.
+    """
+    signs_differ = (a < 0) != (b < 0)
+    return torch.where(signs_differ, -a, a)
+
+def quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
+    """
+    Convert rotations given as quaternions to rotation matrices.
+
+    Args:
+        quaternions: quaternions with real part first,
+            as tensor of shape (..., 4).
+
+    Returns:
+        Rotation matrices as tensor of shape (..., 3, 3).
+    """
+    r, i, j, k = torch.unbind(quaternions, -1)
+    # pyre-fixme[58]: `/` is not supported for operand types `float` and `Tensor`.
+    two_s = 2.0 / (quaternions * quaternions).sum(-1)
+
+    o = torch.stack(
+        (
+            1 - two_s * (j * j + k * k),
+            two_s * (i * j - k * r),
+            two_s * (i * k + j * r),
+            two_s * (i * j + k * r),
+            1 - two_s * (i * i + k * k),
+            two_s * (j * k - i * r),
+            two_s * (i * k - j * r),
+            two_s * (j * k + i * r),
+            1 - two_s * (i * i + j * j),
+        ),
+        -1,
+    )
+    return o.reshape(quaternions.shape[:-1] + (3, 3))
+
+def random_quaternions(
+    n: int, dtype: Optional[torch.dtype] = None, device  = 'cpu'
+) -> torch.Tensor:
+    """
+    Generate random quaternions representing rotations,
+    i.e. versors with nonnegative real part.
+
+    Args:
+        n: Number of quaternions in a batch to return.
+        dtype: Type to return.
+        device: Desired device of returned tensor. Default:
+            uses the current device for the default tensor type.
+
+    Returns:
+        Quaternions as tensor of shape (N, 4).
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    o = torch.randn((n, 4), dtype=dtype, device=device)
+    s = (o * o).sum(1)
+    o = o / _copysign(torch.sqrt(s), o[:, 0])[:, None]
+    return o
+
+def random_rotations(
+    n: int, dtype: Optional[torch.dtype] = None, device = 'cpu'
+) -> torch.Tensor:
+    """
+    Generate random rotations as 3x3 rotation matrices.
+
+    Args:
+        n: Number of rotation matrices in a batch to return.
+        dtype: Type to return.
+        device: Device of returned tensor. Default: if None,
+            uses the current device for the default tensor type.
+
+    Returns:
+        Rotation matrices as tensor of shape (n, 3, 3).
+    """
+    quaternions = random_quaternions(n, dtype=dtype, device=device)
+    return quaternion_to_matrix(quaternions)
+
+def random_rotation(
+    dtype: Optional[torch.dtype] = None, device = 'cpu'
+) -> torch.Tensor:
+    """
+    Generate a single random 3x3 rotation matrix.
+
+    Args:
+        dtype: Type to return
+        device: Device of returned tensor. Default: if None,
+            uses the current device for the default tensor type
+
+    Returns:
+        Rotation matrix as tensor of shape (3, 3).
+    """
+    return random_rotations(1, dtype, device)[0]
+
 
 def random_rotation_matrix(device='cpu'):
         """
@@ -48,6 +155,48 @@ def random_mirror_matrix(device='cpu'):
         else:
             M = torch.eye(3, device=device)
         return M
+
+def apply_point_cloud_dropout(pc, dropout_ratio_range=(0.01, 0.15)):
+    """
+    Randomly drop points from the point cloud to improve robustness.
+    """
+    dropout_ratio = torch.empty(1).uniform_(*dropout_ratio_range)
+    n_points = pc.shape[0]
+    n_keep = int(n_points * (1 - dropout_ratio))
+    
+    indices = torch.randperm(n_points)[:n_keep]
+    pc_dropped = pc[indices]
+    
+    # Pad back to original size with duplicated points if needed
+    if pc_dropped.shape[0] < n_points:
+        pad_indices = torch.randint(0, pc_dropped.shape[0], (n_points - pc_dropped.shape[0],))
+        pc_dropped = torch.cat([pc_dropped, pc_dropped[pad_indices]], dim=0)
+    
+    return pc_dropped
+
+def apply_point_cloud_noise(pc, noise_std=0.01):
+    """
+    Add Gaussian noise to point cloud coordinates.
+    """
+    noise = torch.randn_like(pc) * noise_std
+    pc_noisy = pc + noise
+    pc_noisy = torch.clamp(pc_noisy, -1.0, 1.0)
+    return pc_noisy
+
+def apply_query_point_noise(xyz, noise_std=0.005):
+    """
+    Add noise only to points that will remain in bounds after noise.
+    """
+    noise = torch.randn_like(xyz) * noise_std
+    xyz_noisy = xyz + noise
+    
+    # Create mask for valid points (those that stay in bounds)
+    valid_mask = (xyz_noisy > -1.0).all(dim=-1) & (xyz_noisy < 1.0).all(dim=-1)
+    
+    # Only apply noise where valid
+    xyz_augmented = torch.where(valid_mask.unsqueeze(-1), xyz_noisy, xyz)
+    
+    return xyz_augmented
 
 def apply_transformation(points, transform, normals=None):
     """
@@ -165,17 +314,29 @@ class SdfLoader(base.Dataset):
             pc = torch.tensor(pc, dtype=torch.float32, device=device)
         
         # Get random rotation matrix
-        R = random_rotation_matrix(device=device)
+        R = random_rotation(dtype=torch.float32, device=device)
+        
+        # rotate
+        xyz, _ = apply_transformation(xyz, R)
+        pc, _ = apply_transformation(pc, R)
         
         # Get random mirror matrix
-        M = random_mirror_matrix(device=device)
-        
-        # Combine transformations
-        transform = torch.mm(R, M)
-        
-        # Apply transformations
-        xyz_aug, _ = apply_transformation(xyz, transform)
-        pc_aug, _ = apply_transformation(pc, transform)
+        if torch.rand(1) < 0.5:
+            M = random_mirror_matrix(device=device)
+            # mirror
+            xyz, _ = apply_transformation(xyz, M)
+            pc, _ = apply_transformation(pc, M)
+
+        # 3. Query noise with rejection (SAFE)
+        #if torch.rand(1) < 0.5:
+        #    xyz = apply_query_point_noise(xyz, noise_std=0.003)
+
+        # 4. Point cloud augmentations (SAFE for conditioning)
+        if torch.rand(1) < 0.4:
+            pc = apply_point_cloud_dropout(pc, dropout_ratio_range=(0.05, 0.15))
+
+        if torch.rand(1) < 0.5:
+            pc = apply_point_cloud_noise(pc, noise_std=0.005)
         
         # Note: Pure rotation and mirroring don't change SDF values for normalized shapes
         # But if you want to add scale, you'd need to adjust SDF values too:
@@ -185,14 +346,13 @@ class SdfLoader(base.Dataset):
         # sdf_gt = sdf_gt * scale
         
         # Ensure points stay in [-1, 1] range
-        xyz_aug = torch.clamp(xyz_aug, -1.0, 1.0)
-        pc_aug = torch.clamp(pc_aug, -1.0, 1.0)
+        #xyz = torch.clamp(xyz, -1, 1)
+        pc = torch.clamp(pc, -1, 1)
         
-        return xyz_aug, sdf_gt, pc_aug
+        return xyz, sdf_gt, pc
         
     def __getitem__(self, idx): 
         idx %= len(self.gt_filenames)
-        
         # For float 
         #near_surface_count = int(self.samples_per_mesh*self.surface_percentage) if self.grid_source else self.samples_per_mesh
         near_surface_count = int(self.samples_per_mesh*0.7) if self.grid_source else self.samples_per_mesh
@@ -224,9 +384,9 @@ class SdfLoader(base.Dataset):
             sdf_xyz, sdf_gt, pc = self.augment_data(sdf_xyz, sdf_gt, pc)
         
         data_dict = {
-                    "xyz":sdf_xyz.float().squeeze(),
-                    "gt_sdf":sdf_gt.float().squeeze(), 
-                    "point_cloud":pc.float().squeeze(),
+                        "xyz":sdf_xyz.float().squeeze(),
+                        "gt_sdf":sdf_gt.float().squeeze(), 
+                        "point_cloud":pc.float().squeeze(),
                     }
 
         return data_dict

@@ -55,13 +55,29 @@ class ModulationLoader(torch.utils.data.Dataset):
         
 
     def load_modulations(self, data_source, pc_source, split, f_name="latent.txt", add_flip_augment=False, return_filepaths=True):
+        
         #split = json.load(open(split))
         files = []
         filepaths = [] # return filepaths for loading pcs
+
+        # Determine the SDF file extension
+        sdf_filename = "sdf_data.npy"  # Default to .npy
+        
         for dataset in split: # dataset = "acronym" 
             for class_name in split[dataset]:
                 for instance_name in split[dataset][class_name]:
 
+                    # Check which format exists for SDF data
+                    test_path_npy = os.path.join(pc_source, dataset, class_name, instance_name, "sdf_data.npy")
+                    test_path_csv = os.path.join(pc_source, dataset, class_name, instance_name, "sdf_data.csv")
+                    if os.path.isfile(test_path_npy):
+                        sdf_file = "sdf_data.npy"
+                    elif os.path.isfile(test_path_csv):
+                        sdf_file = "sdf_data.csv"
+                    else:
+                        # Skip if neither exists
+                        continue
+                    
                     if add_flip_augment:
                         for idx in range(4):
                             instance_filename = os.path.join(data_source, class_name, instance_name, "latent_{}.txt".format(idx))
@@ -69,7 +85,7 @@ class ModulationLoader(torch.utils.data.Dataset):
                                 print("Requested non-existent file '{}'".format(instance_filename))
                                 continue
                             files.append( torch.from_numpy(np.loadtxt(instance_filename)).float() )
-                        filepaths.append( os.path.join(pc_source, dataset, class_name, instance_name, "sdf_data.csv") )
+                        filepaths.append( os.path.join(pc_source, dataset, class_name, instance_name, sdf_file) )
 
                     else:
                         instance_filename = os.path.join(data_source, class_name, instance_name, f_name)
@@ -77,7 +93,7 @@ class ModulationLoader(torch.utils.data.Dataset):
                             #print("Requested non-existent file '{}'".format(instance_filename))
                             continue
                         files.append( torch.from_numpy(np.loadtxt(instance_filename)).float() )
-                        filepaths.append( os.path.join(pc_source, dataset, class_name, instance_name, "sdf_data.csv") )
+                        filepaths.append( os.path.join(pc_source, dataset, class_name, instance_name, sdf_file) )
         if return_filepaths:
             return files, filepaths
         return files

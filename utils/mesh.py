@@ -9,14 +9,24 @@ import time
 import torch
 import trimesh
 
-from diso import DiffDMC 
 
 
 # N: resolution of grid; 256 is typically sufficient 
 # max batch: as large as GPU memory will allow
 # shape_feature is either point cloud, mesh_idx (neuralpull), or generated latent code (deepsdf)
 def create_mesh(
-    model, shape_feature, filename, N=256, max_batch=1000000, level_set=0.0, occupancy=False, point_cloud=None, from_plane_features=False, from_pc_features=False
+    model, 
+    shape_feature, 
+    filename, 
+    N=256, 
+    max_batch=1000000, 
+    level_set=0.0, 
+    occupancy=False, 
+    point_cloud=None, 
+    from_plane_features=False, 
+    from_pc_features=False,
+    decode_from_latent=False,
+    diffdmc = None
 ):
     start_time = time.time()
     ply_filename = filename
@@ -24,50 +34,44 @@ def create_mesh(
     model.eval()
 
     # the voxel_origin is the (bottom, left, down) corner, not the middle
+    coords = torch.linspace(-1, 1, N)
+    xx, yy, zz = torch.meshgrid(coords, coords, coords, indexing='ij')
+    cube = torch.stack([xx.flatten(), yy.flatten(), zz.flatten()], dim=1)
+    
     voxel_origin = [-1, -1, -1]
     voxel_size = 2.0 / (N - 1)
-    cube = create_cube(N).float().cuda()
-    cube_points = cube.shape[0]
+    #cube = create_cube(N).float().cuda()
+    #cube_points = cube.shape[0]
     
     # add some noise to the cube values
     #cube[:, 0:3] += torch.randn_like(cube[:, 0:3]) * 0.002
     
-    # Pre-move to GPU
+    # Process in batches with no_grad to save memory
     shape_feature = shape_feature.cuda()
+    sdf_values = []
     
-    head = 0
-    while head < cube_points:
-        query = cube[head : min(head + max_batch, cube_points), 0:3].unsqueeze(0)
-        # inference defined in forward function per pytorch lightning convention
-        #print("shapes: ", shape_feature.shape, query.shape)
-        if from_plane_features:
-            pred_sdf = model.forward_with_plane_features(shape_feature, query)
-        else:
-            pred_sdf = model(shape_feature, query)
-        cube[head : min(head + max_batch, cube_points), 3] = pred_sdf.squeeze() 
-        head += max_batch
-    
-    # for occupancy instead of SDF, subtract 0.5 so the surface boundary becomes 0
-    sdf_values = cube[:, 3] - 0.5 if occupancy else cube[:, 3] 
-    sdf_values = sdf_values.reshape(N, N, N) 
-
-    #diffdmc = DiffDMC(dtype=torch.float32).cuda()
-    #verts, faces = diffdmc(sdf_values, None, isovalue=level_set, normalize=True)
-    #verts[:, 0] = voxel_origin[0] + verts[:, 0]
-    #verts[:, 1] = voxel_origin[1] + verts[:, 1]
-    #verts[:, 2] = voxel_origin[2] + verts[:, 2]
-    #mesh = trimesh.Trimesh(vertices=verts.detach().cpu().numpy(), faces=faces.detach().cpu().numpy(), process=False)
-    #print("inference time: {}".format(time.time() - start_time))
-
-    #mesh.export(file_obj=ply_filename+'.ply')
-    #stl_bytes = trimesh.exchange.stl.export_stl(mesh)
-    
+    with torch.no_grad():
+        for i in range(0, len(cube), max_batch):
+            query = cube[i:i+max_batch].cuda().unsqueeze(0)
+            if decode_from_latent:
+                # VecSet decoding path
+                pred_sdf = model.decode_from_latent(shape_feature, query)
+            elif from_plane_features:
+                pred_sdf = model.forward_with_plane_features(shape_feature, query)
+            else:
+                pred_sdf = model(shape_feature, query)
+            sdf_values.append(pred_sdf.squeeze())
+    if occupancy:
+        sdf_values = sdf_values - 0.5
+    sdf_values = torch.cat(sdf_values).reshape(N, N, N)
+        
     convert_sdf_samples_to_ply(
         sdf_values,
         voxel_origin,
         voxel_size,
         ply_filename + ".ply",
-        level_set
+        level_set,
+        diffdmc=diffdmc
     )
 
 
@@ -102,7 +106,8 @@ def convert_sdf_samples_to_ply(
     voxel_grid_origin,
     voxel_size,
     ply_filename_out,
-    level_set=0.0
+    level_set=0.0,
+    diffdmc = None
 ):
     """
     Convert sdf samples to .ply
@@ -117,43 +122,65 @@ def convert_sdf_samples_to_ply(
     #diffdmc = DiffDMC(dtype=torch.float32).cuda()
     #verts, faces = diffdmc(pytorch_3d_sdf_tensor.float().cuda(), None, isovalue=voxel_size)
     #print(verts)
+
+    if diffdmc is not None:
+        try:
+            verts, faces = diffdmc(pytorch_3d_sdf_tensor, isovalue=level_set, normalize=False)
+            verts = verts.detach().cpu().numpy()
+            faces = faces.detach().cpu().numpy()
+        except Exception as e:
+            print("skipping {}; error: {}".format(ply_filename_out, e))
+            return
+        verts = voxel_size * verts - 1.0
+    else:
+        numpy_3d_sdf_tensor = pytorch_3d_sdf_tensor.detach().cpu().numpy()
+        # use marching_cubes_lewiner or marching_cubes depending on pytorch version 
+        try:
+            verts, faces, _, _ = skimage.measure.marching_cubes(
+                numpy_3d_sdf_tensor, level=level_set, spacing=[voxel_size] * 3
+            )
+        except Exception as e:
+            print("skipping {}; error: {}".format(ply_filename_out, e))
+            return
+        verts = verts - 1.0
+
+    verts_tuple = np.zeros(len(verts), dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")])
+    for i, vert in enumerate(verts):
+        verts_tuple[i] = tuple(vert)
     
-    numpy_3d_sdf_tensor = pytorch_3d_sdf_tensor.detach().cpu().numpy()
-
-    # use marching_cubes_lewiner or marching_cubes depending on pytorch version 
-    try:
-        verts, faces, normals, values = skimage.measure.marching_cubes(
-            numpy_3d_sdf_tensor, level=level_set, spacing=[voxel_size] * 3
-        )
-    except Exception as e:
-        print("skipping {}; error: {}".format(ply_filename_out, e))
-        return
-
-    # transform from voxel coordinates to camera coordinates
-    # note x and y are flipped in the output of marching_cubes
-
-    mesh_points = np.zeros_like(verts)
-    mesh_points[:, 0] = voxel_grid_origin[0] + verts[:, 0]
-    mesh_points[:, 1] = voxel_grid_origin[1] + verts[:, 1]
-    mesh_points[:, 2] = voxel_grid_origin[2] + verts[:, 2]
-
-    num_verts = verts.shape[0]
-    num_faces = faces.shape[0]
-
-    verts_tuple = np.zeros((num_verts,), dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")])
-
-    for i in range(0, num_verts):
-        verts_tuple[i] = tuple(mesh_points[i, :])
-
-    faces_building = []
-    for i in range(0, num_faces):
-        faces_building.append(((faces[i, :].tolist(),)))
-    faces_tuple = np.array(faces_building, dtype=[("vertex_indices", "i4", (3,))])
+    faces_tuple = np.zeros(len(faces), dtype=[("vertex_indices", "i4", (3,))])
+    for i, face in enumerate(faces):
+        faces_tuple[i] = (face,)
 
     el_verts = plyfile.PlyElement.describe(verts_tuple, "vertex")
     el_faces = plyfile.PlyElement.describe(faces_tuple, "face")
+    plyfile.PlyData([el_verts, el_faces]).write(ply_filename_out)
+    
+    # transform from voxel coordinates to camera coordinates
+    # note x and y are flipped in the output of marching_cubes
 
-    ply_data = plyfile.PlyData([el_verts, el_faces])
-    ply_data.write(ply_filename_out)
+    #mesh_points = np.zeros_like(verts)
+    #mesh_points[:, 0] = voxel_grid_origin[0] + verts[:, 0]
+    #mesh_points[:, 1] = voxel_grid_origin[1] + verts[:, 1]
+    #mesh_points[:, 2] = voxel_grid_origin[2] + verts[:, 2]
+
+    #num_verts = verts.shape[0]
+    #num_faces = faces.shape[0]
+
+    #verts_tuple = np.zeros((num_verts,), dtype=[("x", "f4"), ("y", "f4"), ("z", "f4")])
+
+    #for i in range(0, num_verts):
+    #    verts_tuple[i] = tuple(mesh_points[i, :])
+
+    #faces_building = []
+    #for i in range(0, num_faces):
+    #    faces_building.append(((faces[i, :].tolist(),)))
+    #faces_tuple = np.array(faces_building, dtype=[("vertex_indices", "i4", (3,))])
+
+    #el_verts = plyfile.PlyElement.describe(verts_tuple, "vertex")
+    #el_faces = plyfile.PlyElement.describe(faces_tuple, "face")
+
+    #ply_data = plyfile.PlyData([el_verts, el_faces])
+    #ply_data.write(ply_filename_out)
 
 

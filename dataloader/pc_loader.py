@@ -28,7 +28,7 @@ class PCloader(base.Dataset):
         self.return_filename = return_filename
 
         self.pc_paths = self.get_instance_filenames(data_source, split_file, gt_filename="sdf_data.npy")
-        self.pc_paths = self.pc_paths[:5] 
+        #self.pc_paths = self.pc_paths[:5] 
         print("loading {} point clouds into memory...".format(len(self.pc_paths)))
         lst = []
         with tqdm(self.pc_paths) as pbar:
@@ -64,6 +64,7 @@ class PCloader(base.Dataset):
         # data = torch.from_numpy(np.loadtxt(f, delimiter=',')).float()
         # data = torch.from_numpy(pd.read_csv(f, sep=',',header=None).values).float()
         pc = data[data[:,-1]==0][:,:3]
+        #print(pc)
         pc_idx = torch.randperm(pc.shape[0])[:samp] 
         pc = pc[pc_idx]
         #print("pc shape, dtype: ", pc.shape, pc.dtype) # [1024,3], torch.float32

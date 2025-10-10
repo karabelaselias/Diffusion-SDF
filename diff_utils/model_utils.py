@@ -13,6 +13,8 @@ from .pointnet.dgcnn import DGCNN
 
 from .helpers import *
 
+from flash_attn import flash_attn_func, flash_attn_kvpacked_func
+
 class LayerNorm(nn.Module):
     def __init__(self, dim, eps = 1e-5, stable = False):
         super().__init__()
@@ -165,7 +167,8 @@ class Attention(nn.Module):
         dropout = 0.,
         causal = False,
         rotary_emb = None,
-        pb_relax_alpha = 128
+        pb_relax_alpha = 128,
+        use_flash_attn = True
     ):
         super().__init__()
         self.pb_relax_alpha = pb_relax_alpha
@@ -178,7 +181,8 @@ class Attention(nn.Module):
         self.causal = causal
 
         self.norm = LayerNorm(dim)
-
+        
+        self.use_flash_attn = use_flash_attn and causal  # Flash attn works best with causal
         self.dropout = nn.Dropout(dropout)
 
         self.null_kv = nn.Parameter(torch.randn(2, dim_head))
@@ -201,56 +205,134 @@ class Attention(nn.Module):
 
         x = self.norm(x)
         q, k, v = (self.to_q(x), *self.to_kv(context).chunk(2, dim = -1))
-
         q = rearrange(q, 'b n (h d) -> b h n d', h = self.heads)
-        q = q * self.scale
+        
+        if exists(self.rotary_emb):
+            q_rot = self.rotary_emb.rotate_queries_or_keys(q)
+            k_rot = self.rotary_emb.rotate_queries_or_keys(k.unsqueeze(1)).squeeze(1)  # Handle single head
+        else:
+            q_rot = q
+            k_rot = k
+        
+        # Add null key/value
+        nk, nv = repeat_many(self.null_kv.unbind(dim = -2), 'd -> b 1 d', b = b)
+        k = torch.cat((nk, k_rot), dim = -2)
+        v = torch.cat((nv, v), dim = -2)
+        
+        # Use Flash Attention if available and applicable
+        if self.use_flash_attn and self.causal and attn_bias is None:
+            # Flash Attention path
+            
+            # Flash Attention with MQA support
+            # Convert q to [b, n, h, d] format
+            q_flash = rearrange(q_rot, 'b h n d -> b n h d')
+            
+            # For MQA: k,v have only 1 head, need to expand
+            k_expanded = repeat(k, 'b n d -> b n h d', h=self.heads)
+            v_expanded = repeat(v, 'b n d -> b n h d', h=self.heads)            
+            
+            # Create kv_packed in the format Flash Attention expects: [b, n, 2, h, d]
+            kv_packed = torch.stack([k_expanded, v_expanded], dim=2)
+                        
+            # Use flash attention with causal mask
+            out = flash_attn_kvpacked_func(
+                q_flash.to(torch.bfloat16),
+                kv_packed.to(torch.bfloat16),
+                dropout_p=self.dropout.p if self.training else 0.0,
+                causal=True
+            ).to(x.dtype)
+            
+            # out is already [b, n, h, d], reshape to [b, n, h*d]
+            #out = rearrange(out, 'b n h d -> b n (h d)')
+        else:
+            # Original attention path (with your existing code)
+            q = q_rot * self.scale
+            
+            # Calculate attention scores
+            sim = einsum('b h i d, b j d -> b h i j', q, k)
+
+            # Add relative position bias
+            if exists(attn_bias):
+                sim = sim + attn_bias
+
+            # Masking
+            max_neg_value = -torch.finfo(sim.dtype).max
+
+            if exists(mask):
+                mask = F.pad(mask, (1, 0), value = True)
+                mask = rearrange(mask, 'b j -> b 1 1 j')
+                sim = sim.masked_fill(~mask, max_neg_value)
+
+            if self.causal:
+                i, j = sim.shape[-2:]
+                causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
+                sim = sim.masked_fill(causal_mask, max_neg_value)
+
+            # Attention
+            sim = sim - sim.amax(dim = -1, keepdim = True).detach()
+            sim = sim * self.pb_relax_alpha
+
+            attn = sim.softmax(dim = -1)
+            attn = self.dropout(attn)
+
+            # Aggregate values
+            out = einsum('b h i j, b j d -> b h i d', attn, v)
+        
+        # Reshape and output
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+        
+        #q, k, v = (self.to_q(x), *self.to_kv(context).chunk(2, dim = -1))
+
+        #q = rearrange(q, 'b n (h d) -> b h n d', h = self.heads)
+        #q = q * self.scale
 
         # rotary embeddings
 
-        if exists(self.rotary_emb):
-            q, k = map(self.rotary_emb.rotate_queries_or_keys, (q, k))
+        #if exists(self.rotary_emb):
+        #    q, k = map(self.rotary_emb.rotate_queries_or_keys, (q, k))
 
         # add null key / value for classifier free guidance in prior net
 
-        nk, nv = repeat_many(self.null_kv.unbind(dim = -2), 'd -> b 1 d', b = b)
-        k = torch.cat((nk, k), dim = -2)
-        v = torch.cat((nv, v), dim = -2)
+        #nk, nv = repeat_many(self.null_kv.unbind(dim = -2), 'd -> b 1 d', b = b)
+        #k = torch.cat((nk, k), dim = -2)
+        #v = torch.cat((nv, v), dim = -2)
 
         # calculate query / key similarities
 
-        sim = einsum('b h i d, b j d -> b h i j', q, k)
+        #sim = einsum('b h i d, b j d -> b h i j', q, k)
 
         # relative positional encoding (T5 style)
         #print("attn bias, sim shapes: ", attn_bias.shape, sim.shape)
-        if exists(attn_bias):
-            sim = sim + attn_bias
+        #if exists(attn_bias):
+        #    sim = sim + attn_bias
 
         # masking
 
-        max_neg_value = -torch.finfo(sim.dtype).max
+        #max_neg_value = -torch.finfo(sim.dtype).max
 
-        if exists(mask):
-            mask = F.pad(mask, (1, 0), value = True)
-            mask = rearrange(mask, 'b j -> b 1 1 j')
-            sim = sim.masked_fill(~mask, max_neg_value)
+        #if exists(mask):
+        #    mask = F.pad(mask, (1, 0), value = True)
+        #    mask = rearrange(mask, 'b j -> b 1 1 j')
+        #    sim = sim.masked_fill(~mask, max_neg_value)
 
-        if self.causal:
-            i, j = sim.shape[-2:]
-            causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
-            sim = sim.masked_fill(causal_mask, max_neg_value)
+        #if self.causal:
+        #    i, j = sim.shape[-2:]
+        #    causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
+        #    sim = sim.masked_fill(causal_mask, max_neg_value)
 
         # attention
 
-        sim = sim - sim.amax(dim = -1, keepdim = True).detach()
-        sim = sim * self.pb_relax_alpha
+        #sim = sim - sim.amax(dim = -1, keepdim = True).detach()
+        #sim = sim * self.pb_relax_alpha
 
-        attn = sim.softmax(dim = -1)
-        attn = self.dropout(attn)
+        #attn = sim.softmax(dim = -1)
+        #attn = self.dropout(attn)
 
         # aggregate values
 
-        out = einsum('b h i j, b j d -> b h i d', attn, v)
+        #out = einsum('b h i j, b j d -> b h i d', attn, v)
 
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
+        #out = rearrange(out, 'b h n d -> b n (h d)')
+        #return self.to_out(out)
 

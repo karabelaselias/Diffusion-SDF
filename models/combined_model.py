@@ -344,40 +344,42 @@ class CombinedModelVecSet(pl.LightningModule):
         xyz = x['xyz']
         gt = x['gt_sdf'] 
         pc = x['point_cloud']
-
-        # Enable gradient computation for xyz
-        if self.specs['SdfModelSpecs'].get("use_eikonal", False):
-            xyz = xyz.requires_grad_(True)
-        
+ 
         # Get latent and SDF predictions
         latent, bottleneck = self.sdf_model.encode_to_latent(pc)
-        pred_sdf = self.sdf_model.decode_from_latent(latent, xyz)
+
         
+        pred_sdf = self.sdf_model.decode_from_latent(latent, xyz)
+        #sdf_loss = F.l1_loss(pred_sdf.squeeze(), gt.squeeze())
+            
+        # Regularization loss (if using KLBottleneck)
+        reg_loss = bottleneck.get('kl', torch.tensor(0.0)).mean()
+    
         # SDF loss
-        surface_weight = torch.exp(-50 * torch.abs(gt))  # Weight near-surface points more
-        sdf_loss = torch.mean( F.l1_loss(pred_sdf.squeeze(), gt.squeeze(), reduction='none') * surface_weight )
+        #surface_weight = torch.exp(-10 * torch.abs(gt))  # Weight near-surface points more
+        #sdf_loss = torch.mean( F.l1_loss(pred_sdf.squeeze(), gt.squeeze(), reduction='none') * surface_weight )
         #sdf_loss = F.l1_loss(..., reduction='none') * surface_weight
         #sdf_loss = sdf_loss.mean()
-        #sdf_loss = F.l1_loss(pred_sdf.squeeze(), gt.squeeze())
-        
-        # Regularization loss (if using KLBottleneck)
-        reg_loss = bottleneck.get('kl', torch.tensor(0.0)).mean() * self.specs.get("kld_weight", 0.0)
-
+        sdf_loss = F.l1_loss(pred_sdf.squeeze(), gt.squeeze())
+    
         # eikonal
         if self.specs['SdfModelSpecs'].get("use_eikonal", False):
+            xyz_eik = xyz.clone().requires_grad_(True)
+            latent_detached = latent.detach()  # Critical: detach here!
+            pred_sdf_eik = self.sdf_model.decode_from_latent(latent_detached, xyz_eik)
             gradients = torch.autograd.grad(
-                outputs=pred_sdf,
-                inputs=xyz,
-                grad_outputs=torch.ones_like(pred_sdf, requires_grad=False, device=pred_sdf.device),
+                outputs=pred_sdf_eik,
+                inputs=xyz_eik,
+                grad_outputs=torch.ones_like(pred_sdf_eik),
                 create_graph=True,  # Needed for backprop through gradients
                 retain_graph=True,   # Keep graph for loss.backward()
                 only_inputs=True
             )[0]
-            eikonal_loss = ((gradients.norm(2, dim=-1) - 1) ** 2).mean() * self.specs['SdfModelSpecs'].get("eikonal_weight", 0.001)
-            loss = sdf_loss + eikonal_loss + reg_loss
+            eikonal_loss = ((gradients.norm(2, dim=-1) - 1) ** 2).mean()
+            loss = sdf_loss + self.specs['SdfModelSpecs'].get("eikonal_weight", 0.001) * eikonal_loss + reg_loss * self.specs.get("kld_weight", 0.0)
             loss_dict = {"sdf": sdf_loss, "eikonal": eikonal_loss, "total": loss}
         else:
-            loss = sdf_loss + reg_loss
+            loss = sdf_loss + reg_loss  * self.specs.get("kld_weight", 0.0)
             loss_dict = {"sdf": sdf_loss, "total": loss}
         
         self.log_dict(loss_dict, prog_bar=True, enable_graph=False, sync_dist=True)
@@ -458,23 +460,23 @@ class CombinedModelVecSet(pl.LightningModule):
 
         if self.task == 'combined':
             params_list = [
-                    { 'params': list(self.sdf_model.parameters()), 'lr':self.specs['sdf_lr'],  'fused': True},
-                    { 'params': self.diffusion_model.parameters(), 'lr':self.specs['diff_lr'], 'fused': True}
+                    { 'params': list(self.sdf_model.parameters()), 'lr':self.specs['sdf_lr'],  'fused': True, 'weight_decay': 1e-4},
+                    { 'params': self.diffusion_model.parameters(), 'lr':self.specs['diff_lr'], 'fused': True, 'weight_decay': 1e-4}
                 ]
         elif self.task == 'modulation':
             params_list = [
-                    { 'params': self.parameters(), 'lr':self.specs['sdf_lr'], 'fused': True}
+                    { 'params': self.parameters(), 'lr':self.specs['sdf_lr'], 'fused': True, 'weight_decay': 1e-4}
                 ]
         elif self.task == 'diffusion':
             params_list = [
-                    { 'params': self.parameters(), 'lr':self.specs['diff_lr'], 'fused': True}
+                    { 'params': self.parameters(), 'lr':self.specs['diff_lr'], 'fused': True, 'weight_decay': 1e-4}
                 ]
 
         optimizer = torch.optim.AdamW(params_list)
         return {
                 "optimizer": optimizer,
                  "lr_scheduler": {
-                     "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=10000, min_lr=1e-6),
+                     "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=1000, min_lr=1e-7),
                      "monitor": "total"
                  }
         }

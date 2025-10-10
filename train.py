@@ -132,7 +132,7 @@ def train(args, specs):
     loggers = [tb_logger, wandb_logger, csv_logger]
     
     callback = ModelCheckpoint(dirpath=args.exp_dir, 
-                               filename='ckpt-{epoch:02d}-{total:.2f}',
+                               filename='ckpt-{epoch:05d}-{total:.5f}',
                                save_top_k=3,
                                every_n_epochs=specs["log_freq"],
                                monitor='total',
@@ -199,7 +199,7 @@ def train(args, specs):
                                 find_unused_parameters=False,
                                 ddp_comm_hook=default.fp16_compress_hook 
                              ) if args.num_gpus > 1 else 'auto',
-                         precision='bf16-mixed', 
+                         precision=32, 
                          max_epochs=specs["num_epochs"], 
                          callbacks=callbacks, 
                          log_every_n_steps=1,
@@ -207,13 +207,9 @@ def train(args, specs):
                          default_root_dir=args.exp_dir,
                          gradient_clip_val=1.0,
                          num_nodes=args.num_nodes,
-                         accumulate_grad_batches = args.accumulate_grad_batches if hasattr(args, 'accumulate_grad_batches') else 1
+                         accumulate_grad_batches = 2 #args.accumulate_grad_batches if hasattr(args, 'accumulate_grad_batches') else 1
                          #accumulate_grad_batches = 2 if args.num_gpus > 1 else 1
                          )
-
-    # sync batch norm
-    if args.num_gpus > 1:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     
     trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
     
