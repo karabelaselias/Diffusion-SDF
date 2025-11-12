@@ -21,8 +21,8 @@
       "plane_resolution": 128
     },
 
-    "SampPerMesh" : 32000,
-    "PCsize" : 2048,
+    "SampPerMesh" : 16384,
+    "PCsize" : 8192,
   
     "num_epochs" : 100001,
     "log_freq" : 100,
@@ -31,7 +31,7 @@
     "use_normalizing_flow": false,
     "flow_depth": 3,
     "flow_hidden_dim": 512,
-    "sdf_lr" : 1e-3
+    "sdf_lr" : 1e-4
 }
   
   

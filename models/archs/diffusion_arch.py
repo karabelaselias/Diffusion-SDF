@@ -33,7 +33,7 @@ class CausalTransformer(nn.Module):
         final_proj = True, 
         normformer = False,
         rotary_emb = True,
-        use_flash_attn = True,  # Enable flash attention
+        use_flash_attn = False,  # Enable flash attention
         use_checkpoint = False,  # Enable gradient checkpointing
         **kwargs
     ):

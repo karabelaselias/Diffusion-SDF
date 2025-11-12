@@ -32,7 +32,7 @@ class DiffusionModel(nn.Module):
         sample_pc_size = 682, perturb_pc = None,  crop_percent=0.25,
         loss_type = 'l2', objective = 'pred_x0', 
         data_scale = 1.0, data_shift = 0.0,
-        p2_loss_weight_gamma = 0., # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
+        p2_loss_weight_gamma = 1., # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
         p2_loss_weight_k = 1,
         ddim_sampling_eta = 1.
     ):
@@ -273,7 +273,7 @@ class DiffusionModel(nn.Module):
         with torch.no_grad():
             if load_pc:
                 pc = sample_pc(pc, self.pc_size).cuda().unsqueeze(0)
-
+            
             if pc is None:
                 input_pc = None
                 save_pc = False

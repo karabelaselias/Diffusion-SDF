@@ -1,0 +1,54 @@
+{
+  "Description" : "end-to-end training on atria dataset with VecSet latents",
+  "pc_path" : "/home/karabele/data/atria_data_elena/surfaces/diffsdf_data",
+  "total_pc_size" : 8192,
+  "TrainSplit" : "/home/karabele/data/atria_data_elena/surfaces/diffsdf_data/splits/all.json",
+  "TestSplit" : "/home/karabele/data/atria_data_elena/surfaces/diffsdf_data/splits/all.json",
+  "DataSource" : "/home/karabele/data/atria_data_elena/surfaces/diffsdf_data",
+  "GridSource" : "/home/karabele/data/atria_data_elena/surfaces/diffsdf_grid_data",
+  "data_path" : "/home/karabele/workspace/Diffusion-SDF/atria_3d_diffusion_hparam_tune_eikonal/modulations",
+  "modulation_path" : "/home/karabele/workspace/Diffusion-SDF/atria_3d_diffusion_hparam_tune_eikonal/modulations",
+  
+  "modulation_ckpt_path" : "/home/karabele/workspace/Diffusion-SDF/atria_3d_diffusion_hparam_tune_eikonal/ckpt-epoch=949-total=0.01.ckpt",
+  "diffusion_ckpt_path" : "/home/karabele/workspace/Diffusion-SDF/atria_3d_diffusion_hparam_tune_eikonal_stage2_uncond/ckpt-epoch=29999-total=0.00114.ckpt",
+  
+  "training_task": "combined",
+  "SDFModel" : "vecset",
+  "wandb_project" : "atria_3d_diffusion_hparam_tune_eikonal_vecset_uncond",
+  "augment_training": false,  
+    
+  "num_epochs" : 100001,
+  "log_freq" : 100,
+
+  "kld_weight" : 1e-5,
+  "latent_std" : 0.25,
+  
+  "sdf_lr" : 1e-4,
+  "diff_lr" : 5e-6,
+
+  "SdfModelSpecs" : {
+    "hidden_dim" : 1024,
+    "latent_dim" : 16,
+    "num_latents" : 256,
+    "use_eikonal" : true
+  },
+  
+  "SampPerMesh" : 16384,
+  "PCsize" : 8192,
+
+  "diffusion_specs" : {
+    "timesteps" : 1000,
+    "objective" : "pred_x0",
+    "loss_type" : "l2"
+  },
+  
+  "diffusion_model_specs": {
+    "dim" : 1024,
+    "dim_in_out" : 4096,
+    "ff_dropout" : 0.3,
+    "depth" : 4,
+    "cond" : false,
+    "use_flash_attn" : false,
+    "use_checkpoint" : false
+  }
+}

@@ -27,6 +27,8 @@ from diff_utils.helpers import *
 #from metrics import evaluation_metrics
 
 from dataloader.pc_loader import PCloader
+from diso import DiffDMC
+
 
 def fix_compiled_state_dict(state_dict):
     """Fix state dict keys from compiled models (remove _orig_mod wrapper)"""
@@ -282,6 +284,9 @@ def test_sdf_smoothness_vs_occupancy(model, pc, pointnet, save_dir):
 
 @torch.no_grad()
 def test_modulations(args, specs):
+    # Determine which model architecture to use
+    use_vecset = specs.get('SDFModel') == 'vecset'
+    ModelClass = CombinedModelVecSet if use_vecset else CombinedModel
     
     # load dataset, dataloader, model checkpoint
     test_split = json.load(open(specs["TestSplit"]))
@@ -302,12 +307,15 @@ def test_modulations(args, specs):
     #checkpoint['state_dict'] = fix_compiled_state_dict(checkpoint['state_dict'])
     
     #model = CombinedModel.load_from_checkpoint(resume, specs=specs).cuda().eval()
-    model = CombinedModel(specs) #.load_from_checkpoint(resume, specs=specs).cuda().eval()
+    model = ModelClass(specs)
+    #model = CombinedModel(specs) #.load_from_checkpoint(resume, specs=specs).cuda().eval()
     model.load_state_dict(checkpoint['state_dict'])
     model = model.cuda().eval()
 
     # filename for logging chamfer distances of reconstructed meshes
     cd_file = os.path.join(recon_dir, "cd.csv") 
+
+    diffdmc = DiffDMC(dtype=torch.float32).cuda()
 
     with tqdm(test_dataloader) as pbar:
         for idx, data in enumerate(pbar):
@@ -323,13 +331,18 @@ def test_modulations(args, specs):
             mesh_filename = os.path.join(outdir, "reconstruct")
             
             # given point cloud, create modulations (e.g. 1D latent vectors)
-            plane_features = model.sdf_model.pointnet.get_plane_features(point_cloud.cuda())  # tuple, 3 items with ([1, D, resolution, resolution])
-            plane_features = torch.cat(plane_features, dim=1) # ([1, D*3, resolution, resolution])
-            recon = model.vae_model.generate(plane_features) # ([1, D*3, resolution, resolution])
-            #print("mesh filename: ", mesh_filename)
-            # N is the grid resolution for marching cubes; set max_batch to largest number gpu can hold
-            mesh.create_mesh(model.sdf_model, recon, mesh_filename, N=384, max_batch=2**16, from_plane_features=True)
-
+            if use_vecset:
+                # VecSet approach: encode point cloud to latent
+                latent_flat, _ = model.sdf_model.encode_to_latent(point_cloud.cuda())
+                mesh.create_mesh(model.sdf_model, latent_flat, mesh_filename, N=384, max_batch=2**18, from_plane_features=False, decode_from_latent=True, diffdmc=diffdmc)
+            else:
+                plane_features = model.sdf_model.pointnet.get_plane_features(point_cloud.cuda())  # tuple, 3 items with ([1, D, resolution, resolution])
+                plane_features = torch.cat(plane_features, dim=1) # ([1, D*3, resolution, resolution])
+                recon = model.vae_model.generate(plane_features) # ([1, D*3, resolution, resolution])
+                #print("mesh filename: ", mesh_filename)
+                # N is the grid resolution for marching cubes; set max_batch to largest number gpu can hold
+                mesh.create_mesh(model.sdf_model, recon, mesh_filename, N=384, max_batch=2**18, from_plane_features=True, diffdmc=diffdmc)
+            
             # load the created mesh (mesh_filename), and compare with input point cloud
             # to calculate and log chamfer distance 
             mesh_log_name = cls_name+"/"+mesh_name
@@ -346,29 +359,32 @@ def test_modulations(args, specs):
                 # skips modulations that have chamfer distance > 0.0018
                 # the filter also weighs gaps / empty space higher
                 if not filter_threshold(mesh_filename, point_cloud, 0.006): 
-                    continue
-                outdir = os.path.join(latent_dir, "{}/{}".format(cls_name, mesh_name))
-                os.makedirs(outdir, exist_ok=True)
-                features = model.sdf_model.pointnet.get_plane_features(point_cloud.cuda())
-                features = torch.cat(features, dim=1) # ([1, D*3, resolution, resolution])
-                latent = model.vae_model.get_latent(features) # (1, D*3)
-                np.savetxt(os.path.join(outdir, "latent.txt"), latent.cpu().numpy())
+                    continue    
+                if use_vecset:
+                    # Get latent directly (already have it from above, but showing full flow)
+                    latent_flat, _ = model.sdf_model.encode_to_latent(point_cloud.cuda())
+                    np.savetxt(os.path.join(outdir, "latent.txt"), latent_flat.detach().cpu().numpy())
+                else:
+                    features = model.sdf_model.pointnet.get_plane_features(point_cloud.cuda())
+                    features = torch.cat(features, dim=1) # ([1, D*3, resolution, resolution])
+                    latent = model.vae_model.get_latent(features) # (1, D*3)
+                    np.savetxt(os.path.join(outdir, "latent.txt"), latent.detach().cpu().numpy())
             except Exception as e:
                 print(e)
-
-
-           
+   
 @torch.no_grad()
 def test_generation(args, specs):
-
+    
+    # Determine which model architecture to use
+    use_vecset = specs.get('SDFModel') == 'vecset'
+    ModelClass = CombinedModelVecSet if use_vecset else CombinedModel
+    
     # load model 
     if args.resume == 'finetune': # after second stage of training 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-
-            # loads the sdf and vae models
-            model = CombinedModel.load_from_checkpoint(specs["modulation_ckpt_path"], specs=specs, strict=False) 
-
+            # loads the sdf and vae models (or sdf model for VecSet)
+            model = ModelClass.load_from_checkpoint(specs["modulation_ckpt_path"], specs=specs, strict=False) 
             # loads the diffusion model; directly calling diffusion_model.load_state_dict to prevent overwriting sdf and vae params
             ckpt = torch.load(specs["diffusion_ckpt_path"])
             new_state_dict = {}
@@ -376,22 +392,39 @@ def test_generation(args, specs):
                 new_key = k.replace("diffusion_model.", "") # remove "diffusion_model." from keys since directly loading into diffusion model
                 new_state_dict[new_key] = v
             model.diffusion_model.load_state_dict(new_state_dict)
-
             model = model.cuda().eval()
     else:
-        ckpt = "{}.ckpt".format(args.resume) if args.resume=='last' else "epoch={}.ckpt".format(args.resume)
+        ckpt = "{}.ckpt".format(args.resume) #if args.resume=='last' else "epoch={}.ckpt".format(args.resume)
         resume = os.path.join(args.exp_dir, ckpt)
-        model = CombinedModel.load_from_checkpoint(resume, specs=specs).cuda().eval()
+        model = ModelClass.load_from_checkpoint(resume, specs=specs).cuda().eval()
 
     conditional = specs["diffusion_model_specs"]["cond"] 
 
+    diffdmc = DiffDMC(dtype=torch.float32).cuda()
+    
     if not conditional:
         samples = model.diffusion_model.generate_unconditional(args.num_samples)
-        plane_features = model.vae_model.decode(samples)
-        for i in range(len(plane_features)):
-            plane_feature = plane_features[i].unsqueeze(0)
-            mesh.create_mesh(model.sdf_model, plane_feature, recon_dir+"/{}_recon".format(i), N=128, max_batch=2**21, from_plane_features=True)
-            
+        # Decode based on architecture
+        if use_vecset:
+            # VecSet path: samples are already flat latents, just decode to mesh
+            for i in range(len(samples)):
+                latent = samples[i:i+1]  # Keep batch dimension
+                mesh_filename = os.path.join(recon_dir, "{}_recon".format(i))
+                mesh.create_mesh(
+                    model.sdf_model, 
+                    latent, 
+                    mesh_filename, 
+                    N=384, 
+                    max_batch=2**18, 
+                    decode_from_latent=True,  # Use VecSet decoding path
+                    diffdmc=diffdmc
+                )
+        else:
+            plane_features = model.vae_model.decode(samples)
+            for i in range(len(plane_features)):
+                plane_feature = plane_features[i].unsqueeze(0)
+                mesh.create_mesh(model.sdf_model, plane_feature, recon_dir+"/{}_recon".format(i), N=384, max_batch=2**18,
+                                 from_plane_features=True, diffdmc=diffdmc)
     else:
         # load dataset, dataloader, model checkpoint
         test_split = json.load(open(specs["TestSplit"]))
@@ -417,15 +450,30 @@ def test_generation(args, specs):
                     count = 0
                     while len(tmp_lst)<args.num_samples:
                         count+=1
-                        samples, perturbed_pc = model.diffusion_model.generate_from_pc(point_cloud.cuda(), batch=args.num_samples, save_pc=outdir, return_pc=True) # batch should be set to max number GPU can hold
-                        plane_features = model.vae_model.decode(samples)
-                        # predicting the sdf values of the point cloud
-                        perturbed_pc_pred = model.sdf_model.forward_with_plane_features(plane_features, perturbed_pc.repeat(args.num_samples, 1, 1))
-                        consistency = F.l1_loss(perturbed_pc_pred, torch.zeros_like(perturbed_pc_pred), reduction='none')
+                        samples, perturbed_pc = model.diffusion_model.generate_from_pc(point_cloud.cuda(), 
+                                                                                       batch=args.num_samples, 
+                                                                                       save_pc=outdir, 
+                                                                                       return_pc=True) # batch should be set to max number GPU can hold
+                        if use_vecset:
+                            # VecSet filtering path
+                            pred_sdf = model.sdf_model.decode_from_latent(
+                                samples, 
+                                perturbed_pc.repeat(args.num_samples, 1, 1)
+                            )
+                        else:
+                            plane_features = model.vae_model.decode(samples)
+                            # predicting the sdf values of the point cloud
+                            pred_sdf = model.sdf_model.forward_with_plane_features(plane_features, 
+                                                                                   perturbed_pc.repeat(args.num_samples, 1, 1))
+                        consistency = F.l1_loss(pred_sdf, torch.zeros_like(pred_sdf), reduction='none')
                         loss = reduce(consistency, 'b ... -> b', 'mean', b = consistency.shape[0]) # one value per generated sample 
-                        #print("consistency shape: ", consistency.shape, loss.shape, consistency[0].mean(), consistency[1].mean(), loss) # cons: [B,N]; loss: [B]
+                        print("consistency shape: ", consistency.shape, loss.shape, consistency[0].mean(), consistency[1].mean(), loss) # cons: [B,N]; loss: [B]
                         thresh_idx = loss<=threshold
-                        tmp_lst.extend(plane_features[thresh_idx])
+                        
+                        if use_vecset:
+                            tmp_lst.extend([samples[i:i+1] for i in range(args.num_samples) if thresh_idx[i]])
+                        else:
+                            tmp_lst.extend([plane_features[i] for i in range(args.num_samples) if thresh_idx[i]])
 
                         if count > 5: # repeat this filtering process as needed 
                             break
@@ -433,20 +481,42 @@ def test_generation(args, specs):
                     # just use the samples that are produced if comparing to other methods
                     if len(tmp_lst)<1: 
                         continue
-                    plane_features = tmp_lst[0:min(10,len(tmp_lst))]
+                    
+                    latents_or_features = tmp_lst[0:min(10, len(tmp_lst))]
 
                 else:
                     # for each point cloud, the partial pc and its conditional generations are all saved in the same directory 
-                    samples, perturbed_pc = model.diffusion_model.generate_from_pc(point_cloud.cuda(), batch=args.num_samples, save_pc=outdir, return_pc=True)
-                    plane_features = model.vae_model.decode(samples)
+                    samples, perturbed_pc = model.diffusion_model.generate_from_pc(point_cloud.cuda(), batch=args.num_samples, 
+                                                                                   save_pc=outdir, return_pc=True)
+                    if use_vecset:
+                        latents_or_features = [samples[i:i+1] for i in range(len(samples))]
+                    else:
+                        plane_features = model.vae_model.decode(samples)
+                        latents_or_features = [plane_features[i].unsqueeze(0) for i in range(len(plane_features))]
                 
-                for i in range(len(plane_features)):
-                    plane_feature = plane_features[i].unsqueeze(0)
-                    mesh.create_mesh(model.sdf_model, plane_feature, outdir+"/{}_recon".format(i), N=128, max_batch=2**21, from_plane_features=True)
-            
-
-
-    
+                for i, feature in enumerate(latents_or_features):
+                    mesh_filename = os.path.join(outdir, "{}_recon".format(i))
+                    if use_vecset:
+                        mesh.create_mesh(
+                            model.sdf_model, 
+                            feature, 
+                            mesh_filename, 
+                            N=384, 
+                            max_batch=2**18, 
+                            decode_from_latent=True,
+                            diffdmc=diffdmc
+                        )
+                    else:
+                        mesh.create_mesh(
+                            model.sdf_model, 
+                            feature, 
+                            mesh_filename, 
+                            N=384, 
+                            max_batch=2**18, 
+                            from_plane_features=True,
+                            diffdmc=diffdmc
+                        )
+                        
 if __name__ == "__main__":
 
     import argparse
@@ -489,5 +559,5 @@ if __name__ == "__main__":
         latent_dir = os.path.join(args.exp_dir, "modulations")
         os.makedirs(latent_dir, exist_ok=True)
         test_modulations(args, specs)
-    elif specs['training_task'] == 'combined':
+    elif specs['training_task'] == 'combined' or specs['training_task'] == 'diffusion':
         test_generation(args, specs)

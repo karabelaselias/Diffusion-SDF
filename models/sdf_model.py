@@ -15,6 +15,7 @@ from einops import rearrange, reduce
 
 from models.archs.sdf_decoder import * 
 from models.archs.encoders.conv_pointnet import ConvPointnet
+from models.archs.encoders.dgcnn import DGCNN
 from utils import mesh, evaluate
 
 class SdfModel(pl.LightningModule):

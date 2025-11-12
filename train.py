@@ -145,7 +145,11 @@ def train(args, specs):
     
     callbacks = [callback, lr_monitor]
 
-    model = CombinedModel(specs) if specs['SDFModel'] != 'vecset' else CombinedModelVecSet(specs)
+    #model = CombinedModel(specs) if specs['SDFModel'] != 'vecset' else CombinedModelVecSet(specs)
+    use_vecset = specs.get('SDFModel') == 'vecset'
+    ModelClass = CombinedModelVecSet if use_vecset else CombinedModel
+    model = ModelClass(specs)
+    
     # Compile model if PyTorch 2.0+
     if torch.__version__ >= '2.0.0' and specs.get('compile_model', False) :
         print("Compiling model components...")
@@ -160,10 +164,11 @@ def train(args, specs):
     # note on loading from checkpoint:
     # if resuming from training modulation, diffusion, or end-to-end, just load saved checkpoint 
     # however, if fine-tuning end-to-end after training modulation and diffusion separately, will need to load sdf and diffusion checkpoints separately
-    if args.resume == 'finetune':
+    resume = args.resume
+    if resume == 'finetune':
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            model = model.load_from_checkpoint(specs["modulation_ckpt_path"], specs=specs, strict=False)
+            model = ModelClass.load_from_checkpoint(specs["modulation_ckpt_path"], specs=specs, strict=False)
             # loads the diffusion model; directly calling diffusion_model.load_state_dict to prevent overwriting sdf and vae params
             ckpt = torch.load(specs["diffusion_ckpt_path"])
             new_state_dict = {}
@@ -172,7 +177,7 @@ def train(args, specs):
                 new_state_dict[new_key] = v
             model.diffusion_model.load_state_dict(new_state_dict)
         resume = None
-    elif args.resume is not None:
+    elif resume is not None:
         ckpt = "{}.ckpt".format(args.resume)
         #ckpt = "{}.ckpt".format(args.resume) if args.resume=='last' else "epoch={}.ckpt".format(args.resume)
         resume = os.path.join(args.exp_dir, ckpt)

@@ -7,20 +7,22 @@
 
     "SDFModel" : "vecset",
 
-    "wandb_project" : "atria_3d_diffusion_hparam_tune_no_eikonal_vecset",
+    "wandb_project" : "atria_3d_diffusion_hparam_tune_eikonal_vecset",
     
     "training_task": "modulation",
-    "augment_training": true,
+    "augment_training": false,
     "compile_model": false,
   
     "SdfModelSpecs" : {
       "hidden_dim" : 1024,
-      "latent_dim" : 32,
-      "num_latents" : 256
+      "latent_dim" : 16,
+      "num_latents" : 256,
+      "use_eikonal" : true
     },
+    
     "SampPerMesh" : 16384,
     "PCsize" : 8192,
-    "num_epochs" : 100001,
+    "num_epochs" : 2001,
     "log_freq" : 50,
     "sdf_lr" : 1e-4
 }
